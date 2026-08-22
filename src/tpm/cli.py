@@ -412,46 +412,115 @@ def cmd_cache(args, ui, db):
 
 
 def cmd_clean(args, ui, db):
-    """Interactive review screen. Never deletes without explicit confirmation."""
+    """Interactive cleanup review with per-category confirmation.
+
+    Never deletes without explicit user choice. Shows all detected
+    caches + orphan packages, lets user pick what to clean.
+    """
+    from .cleanup import (clean_apt_cache, clean_pip_cache, clean_npm_cache,
+                          clean_cargo_cache, clean_gradle_cache,
+                          clean_pacman_cache, clean_orphans)
+    from .core import load_state
+
     caches = [c for c in detect_caches() if c["size"] > 1024]
-    total = sum(c["size"] for c in caches)
-    ui.heading("CLEANUP REVIEW")
-    for i, c in enumerate(caches, 1):
-        ui.line(f"[{i}] {c['label']:<24} {format_size(c['size'], 2):>10}   "
-                f"{c['path']}")
-    ui.line(f"\nPotential recovery: {format_size(total, 2)}")
-    if args.yes:
-        ui.warn("--yes given for clean; cleaning APT cache only (safe op)")
-        targets = [c for c in caches if "APT" in c["label"]]
-    elif not sys.stdin.isatty():
+
+    # Also find orphan packages
+    state = _load(db)
+    orphans = []
+    for name, row in state.graph.packages.items():
+        if state.classification(name)[0] == "ORPHAN":
+            orphans.append((name, row.get("installed_size") or 0))
+    orphans.sort(key=lambda x: -x[1])
+    orphan_total = sum(s for _, s in orphans)
+
+    items = []
+    for c in caches:
+        items.append({"label": c["label"], "path": c["path"],
+                      "size": c["size"], "type": "cache"})
+    if orphans:
+        items.append({"label": f"{len(orphans)} orphan packages",
+                      "path": None, "size": orphan_total,
+                      "type": "orphans"})
+
+    total = sum(i["size"] for i in items)
+
+    if args.json:
+        ui.emit_json({"items": [{"label": i["label"], "bytes": i["size"],
+                                 "type": i["type"]} for i in items],
+                      "total_bytes": total})
+        return 0
+
+    ui.heading("CLEANUP")
+    if not items:
+        ui.line("Nothing to clean.")
+        return 0
+    for i, item in enumerate(items, 1):
+        ui.line(f"[{i}] {item['label']:<30} {format_size(item['size'], 2):>10}")
+    ui.line(f"\nTotal potential recovery: {format_size(total, 2)}")
+
+    if not sys.stdin.isatty():
         ui.line("\n(non-interactive; nothing was deleted)")
         return 0
+
+    ui.line("\nEnter numbers to clean (comma-separated), 'a' for all, 'q' to quit: ", )
+    answer = input("> ").strip().lower()
+    if answer in ("q", "", "quit"):
+        ui.line("Nothing was deleted.")
+        return 0
+
+    if answer == "a":
+        selected = list(range(len(items)))
     else:
-        answer = input("\nClean APT cache only? [y/N] ").strip().lower()
-        targets = [c for c in caches if "APT" in c["label"]] \
-            if answer == "y" else []
-        if answer == "y":
-            pass
+        try:
+            selected = [int(x.strip()) - 1 for x in answer.split(",")]
+        except ValueError:
+            ui.err("invalid input")
+            return 1
+
+    # Confirm each selected category
+    to_clean = []
+    for idx in selected:
+        if idx < 0 or idx >= len(items):
+            continue
+        item = items[idx]
+        ui.line(f"\nClean '{item['label']}' ({format_size(item['size'], 2)})? [y/N] ", )
+        confirm = input("> ").strip().lower()
+        if confirm == "y":
+            to_clean.append(item)
+
+    if not to_clean:
+        ui.line("Nothing was deleted.")
+        return 0
+
+    # Execute cleaning
+    total_cleaned = 0
+    for item in to_clean:
+        ui.line(f"Cleaning {item['label']}...", )
+        result = None
+        if item["label"] == f"{len(orphans)} orphan packages":
+            result = clean_orphans(db, dry_run=False)
+        elif "APT" in item["label"]:
+            result = clean_apt_cache(dry_run=False)
+        elif "pacman" in item["label"]:
+            result = clean_pacman_cache(dry_run=False)
+        elif "pip" in item["label"]:
+            result = clean_pip_cache(dry_run=False)
+        elif "npm" in item["label"]:
+            result = clean_npm_cache(dry_run=False)
+        elif "cargo" in item["label"]:
+            result = clean_cargo_cache(dry_run=False)
+        elif "gradle" in item["label"]:
+            result = clean_gradle_cache(dry_run=False)
+        if result:
+            total_cleaned += result.cleaned_bytes
+            if result.errors:
+                for e in result.errors[:3]:
+                    ui.warn(f"  {e}")
+            ui.line(f"  Cleaned: {format_size(result.cleaned_bytes, 2)}")
         else:
-            ui.line("Nothing was deleted.")
-            return 0
-    cleaned = 0
-    for c in targets:
-        archives = os.path.join(c["path"], "archives") \
-            if c["path"].endswith("apt") else c["path"]
-        if os.path.isdir(archives):
-            for entry in os.listdir(archives):
-                fp = os.path.join(archives, entry)
-                try:
-                    if os.path.isfile(fp) and not os.path.islink(fp) \
-                            and (entry.endswith(".deb") or
-                                 entry.endswith(".list") or
-                                 "cache" in entry):
-                        cleaned += os.path.getsize(fp)
-                        os.remove(fp)
-                except OSError as e:
-                    ui.warn(f"could not remove {fp}: {e}")
-    ui.line(f"Cleaned: {format_size(cleaned, 2)}")
+            ui.warn(f"  No cleanup handler for: {item['label']}")
+
+    ui.line(f"\nTotal cleaned: {format_size(total_cleaned, 2)}")
     return 0
 
 
