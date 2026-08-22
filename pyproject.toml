@@ -1,0 +1,16 @@
+[project]
+name = "tpm"
+version = "0.1.0"
+description = "Termux Package Manager & Storage Analyzer"
+requires-python = ">=3.10"
+dependencies = ["rich"]
+
+[project.scripts]
+tpm = "tpm.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
