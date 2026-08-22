@@ -200,6 +200,14 @@ def cmd_info(args, ui, db):
     row = entry["row"]
     g = state.graph
 
+    # Lazy-populate files for accurate count
+    if not db.files_populated(name):
+        backend = detect_backend()
+        if backend:
+            file_list = backend.file_list(name)
+            db.populate_files(name, file_list)
+    file_count = db.file_count(name)
+
     def dep_lines():
         out = []
         installed_names = set(g.packages)
@@ -224,7 +232,7 @@ def cmd_info(args, ui, db):
         "dependencies": [{"name": n, "type": t} for n, t in dep_lines()],
         "reverse_dependencies": g.direct_rdeps(name),
         "recursive_reverse_dependencies": g.recursive_rdeps(name),
-        "file_count_indexed": db.file_count(name),
+        "file_count_indexed": file_count,
     }
     if args.json:
         ui.emit_json(data)
@@ -236,7 +244,7 @@ def cmd_info(args, ui, db):
     ui.line(f"Installed size:      {format_size(row['installed_size'])}")
     ui.line(f"Type:                {data['type']}"
             + ("  [ESSENTIAL]" if row["essential"] else ""))
-    ui.line(f"Files indexed:       {db.file_count(name)}")
+    ui.line(f"Files indexed:       {file_count}")
 
     deps = data["dependencies"]
     ui.line(f"\nDependencies ({len(deps)}):")
@@ -327,7 +335,17 @@ def cmd_orphans(args, ui, db):
 def cmd_files(args, ui, db):
     name = validate_package_name(args.package)
     backend = _check_backend(ui)
-    files = backend.file_list(name)
+    # Lazy-populate: if files not cached yet, fetch from backend
+    if not db.files_populated(name):
+        ui.warn(f"fetching file list for {name}...")
+        files = backend.file_list(name)
+        db.populate_files(name, files)
+    else:
+        files = [(r["path"], r["size"]) for r in
+                 db.conn.execute(
+                     "SELECT path, size FROM files f JOIN packages p "
+                     "ON p.id=f.package_id WHERE p.name=?",
+                     (name,)).fetchall()]
     if not files:
         ui.err(f"no file list for: {name}")
         return 1
@@ -342,7 +360,7 @@ def cmd_files(args, ui, db):
     for p, s in files:
         size = format_size(s) if s is not None else ""
         ui.line(f"{size:>12}  {p}")
-    ui.line(f"\n{len(files)} shown / total listed above")
+    ui.line(f"\n{len(files)} shown")
     return 0
 
 

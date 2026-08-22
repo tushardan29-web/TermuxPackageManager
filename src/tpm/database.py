@@ -174,6 +174,29 @@ class Database:
             (package_name,)).fetchone()
         return row["n"]
 
+    def files_populated(self, package_name):
+        """True if files table has entries for this package."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM files f JOIN packages p "
+            "ON p.id=f.package_id WHERE p.name=?",
+            (package_name,)).fetchone()
+        return row["n"] > 0
+
+    def populate_files(self, package_name, file_list):
+        """file_list: [(path, size_or_None)] from backend."""
+        cur = self.conn.cursor()
+        row = cur.execute("SELECT id FROM packages WHERE name=?",
+                          (package_name,)).fetchone()
+        if not row:
+            return 0
+        pid = row["id"]
+        cur.execute("DELETE FROM files WHERE package_id=?", (pid,))
+        cur.executemany(
+            "INSERT OR IGNORE INTO files(package_id, path, size) "
+            "VALUES(?,?,?)", [(pid, p, s) for p, s in file_list])
+        self.conn.commit()
+        return len(file_list)
+
     def largest_files(self, package_name, limit=20):
         return self.conn.execute(
             "SELECT path, size FROM files f JOIN packages p "
