@@ -32,6 +32,7 @@ from rich.theme import Theme
 
 from .core import load_state
 from .formatter import format_size
+from .package.backend import detect_backend
 from .storage.scanner import (
     detect_caches,
     largest_dirs,
@@ -585,6 +586,11 @@ class PackageInfoScreen(Screen):
         fcount = None
         if db is not None:
             try:
+                if not db.files_populated(self.name):
+                    backend = detect_backend()
+                    if backend:
+                        file_list = backend.file_list(self.name)
+                        db.populate_files(self.name, file_list)
                 fcount = db.file_count(self.name)
             except Exception:
                 fcount = None
