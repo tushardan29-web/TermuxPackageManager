@@ -304,6 +304,103 @@ class PacmanBackend(PackageManagerBackend):
             proc.stdout.strip() or proc.stderr.strip()
 
 
+# ------------------------------------------------------------------- uv
+
+
+class UvBackend(PackageManagerBackend):
+    name = "uv"
+
+    def available(self):
+        return bool(shutil.which("uv"))
+
+    def db_mtime(self):
+        # uv doesn't have a traditional database; use cache dir mtime
+        home = os.path.expanduser("~")
+        cache_dir = os.path.join(home, ".cache", "uv")
+        try:
+            return int(os.stat(cache_dir).st_mtime)
+        except OSError:
+            return None
+
+    def list_installed(self):
+        from ..dependency.parser import parse_depends_field
+        # uv pip list --format json gives name, version, source
+        proc = subprocess.run(
+            ["uv", "pip", "list", "--format", "json"],
+            capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            return
+        import json
+        try:
+            packages = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return
+        for pkg in packages:
+            name = pkg.get("name", "")
+            version = pkg.get("version", "")
+            yield {
+                "name": name,
+                "version": version or None,
+                "architecture": None,
+                "status": "installed",
+                "installed_size": None,
+                "explicitly_installed": 1,
+                "essential": 0,
+                "priority": None,
+                "source": "uv",
+                "description": None,
+                "depends_groups": [],
+            }
+
+    def explicit_names(self):
+        # uv treats all packages as explicitly installed
+        names = set()
+        proc = subprocess.run(
+            ["uv", "pip", "list", "--format", "json"],
+            capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            return names
+        import json
+        try:
+            packages = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return names
+        return {pkg.get("name", "") for pkg in packages}
+
+    def essential_names(self):
+        return set()
+
+    def file_list(self, package):
+        validate_package_name(package)
+        # uv doesn't have a direct file list command; use pip show
+        proc = subprocess.run(
+            ["uv", "pip", "show", package],
+            capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            return []
+        # Parse Location from pip show output
+        location = None
+        for line in proc.stdout.splitlines():
+            if line.startswith("Location:"):
+                location = line.split(":", 1)[1].strip()
+                break
+        if not location or not os.path.isdir(location):
+            return []
+        # Walk the package directory
+        files = []
+        pkg_dir = os.path.join(location, package)
+        if os.path.isdir(pkg_dir):
+            for root, dirs, fnames in os.walk(pkg_dir):
+                for fname in fnames:
+                    fp = os.path.join(root, fname)
+                    try:
+                        size = os.lstat(fp).st_size
+                    except OSError:
+                        size = None
+                    files.append((fp, size))
+        return files
+
+
 # ------------------------------------------------------------- detection
 
 
@@ -319,5 +416,9 @@ def detect_backend(env=None):
     pb = PacmanBackend(prefix=env.get("prefix"))
     if pb.available():
         backends.append(("pacman" in (preferred,), pb))
+    if shutil.which("uv"):
+        ub = UvBackend()
+        if ub.available():
+            backends.append(("uv" in (preferred,), ub))
     backends.sort(key=lambda t: -t[0])
     return backends[0][1] if backends else None

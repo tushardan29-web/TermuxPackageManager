@@ -31,24 +31,24 @@ modules. No logic is duplicated.
 | Module | Purpose |
 |--------|---------|
 | `cli.py` | Argparse entry point, 18 commands, JSON output |
-| `tui.py` | Interactive TUI (rich-based), 10 screen types, mouse+keyboard |
+| `tui.py` | Interactive TUI (curses-based), 10 screen types, auto-resize, mouse+keyboard |
 | `core.py` | SystemState loading, freshness checks |
 | `scanner.py` | Scan orchestration, staleness detection |
 | `database.py` | SQLite index with schema, indexes, read/write |
 | `config.py` | TOML-like config reader |
-| `cleanup.py` | Cache cleanup backends (APT/pip/npm/cargo/gradle/pacman) |
+| `cleanup.py` | Cache cleanup backends (APT/pip/npm/cargo/gradle/pacman/uv) |
 | `environment.py` | Detects Termux vs Linux, active package manager |
 | `formatter.py` | Centralized binary size formatting (KiB/MiB/GiB) |
 | `validation.py` | Package name validation (shell-safe) |
 | `dependency/parser.py` | Debian dependency expression parser |
 | `dependency/graph.py` | Adjacency-based dependency graph |
 | `removal/simulator.py` | Graph reachability removal simulation |
-| `package/backend.py` | Backend abstraction + AptBackend + PacmanBackend |
+| `package/backend.py` | Backend abstraction + AptBackend + PacmanBackend + UvBackend |
 | `storage/scanner.py` | Filesystem scanner, cache detection |
 
 ## Backend Abstraction
 
-`PackageManagerBackend` is the interface. Two implementations:
+`PackageManagerBackend` is the interface. Three implementations:
 
 ### AptBackend (dpkg/apt)
 
@@ -66,12 +66,20 @@ modules. No logic is duplicated.
 - `%REASON%` field: 0 = explicit, 1 = dependency
 - No essential concept (always returns empty set)
 
+### UvBackend
+
+- `uv pip list --format json` for installed packages
+- `uv pip show <pkg>` for file lists
+- Treats all packages as explicitly installed
+- Cache cleanup via `uv cache clean`
+
 ### Backend Selection: `detect_backend()`
 
-1. Checks `TERMUX_APP_PACKAGE_MANAGER` env var
+1. Checks `TERMUX_APP_PACKAGE_MANAGER` env var (apt, pacman, or pkg)
 2. Falls back to checking dpkg DB presence
 3. Checks for pacman local DB with content
-4. Prefers the active manager when both databases exist
+4. Checks for uv availability
+5. Prefers the active manager when multiple backends exist
 
 Both backends produce identical record dicts:
 
@@ -206,40 +214,42 @@ cleanup:
 
 ## TUI Architecture
 
-The TUI uses a screen-stack pattern with rich's Live display:
+The TUI uses a screen-stack pattern with curses:
 
 ```
-_App
-  stack: [DashboardScreen, PackageListScreen, PackageDetailScreen]
-                                    ^current
-  _dispatch(key) -> screen.handle(key, ctx) -> (action, ...)
+App
+  stack: [Dashboard, PkgList, Detail, ...]
+                         ^current
+  _handle_result(key) -> screen.key(ctx, k) -> (action, ...)
 ```
 
 ### Screen types
 
 | Screen | Purpose |
 |--------|---------|
-| DashboardScreen | Stats overview, navigation hub |
-| PackageListScreen | Filterable/sortable package table with search |
-| PackageDetailScreen | Full info, deps, rdeps, files, simulation |
-| TreeScreen | Recursive dep/rdep tree viewer |
-| StorageScreen | Directory browser with sizes, drill-down |
+| Dashboard | Stats overview, navigation hub, terminal size |
+| PkgList | Filterable/sortable package table with search, delete |
+| Detail | Full info, deps, rdeps, files, simulation |
+| ConfirmRemoval | Simulation display, typed confirmation before removal |
+| Storage | Directory browser with sizes, drill-down, file/folder delete |
 | CacheScreen | Cache detection, per-item selection and cleanup |
-| OrphanScreen | Orphan list, batch selection and cleanup |
-| DepBrowserScreen | Packages sorted by dependency count |
-| SearchScreen | Live search across packages |
-| RemoveConfirmScreen | Typed confirmation before removal |
+| Orphans | Orphan list, batch selection, individual delete |
+| DepBrowser | Packages sorted by dependency count, delete |
+| Search | Live search across packages, delete |
 
 ### Input handling
 
-- Raw terminal mode (cbreak) for instant key response
-- SGR mouse protocol for click support
-- Vi keys (j/k) + arrow keys + emacs (ctrl-a/e) on all lists
+- curses raw terminal mode for instant key response
+- Mouse support via ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION
+- Vi keys (j/k) + arrow keys on all lists
 - Screen stack: push (enter detail), pop (back), replace (navigate)
+- Auto-resize on terminal size change (KEY_RESIZE)
+- Scroll indicators (^^/vv) for out-of-bounds content
 
 ### Security in TUI
 
 - Cache cleanup: shows WARNING panel with path/size, requires typing "yes"
-- Package removal: shows simulation, requires typing "yes"
+- Package removal: shows simulation (cascade, retained, recovery), requires typing "yes"
+- Storage delete: shows path/size, requires typing "yes"
 - Orphan cleanup: batch selection, confirmation dialog
 - No destructive action executes without explicit typed confirmation

@@ -37,7 +37,7 @@ def detect_environment():
 
     # Active manager: Termux exposes it explicitly.
     mgr = os.environ.get("TERMUX_APP_PACKAGE_MANAGER")
-    if mgr in ("apt", "pacman"):
+    if mgr in ("apt", "pacman", "pkg"):
         info["manager"] = mgr
         return info
     # Else infer from available databases/binaries (Debian vs Arch etc).

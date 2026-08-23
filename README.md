@@ -48,18 +48,18 @@ tpm tui
 | Dependency classification | EXPLICIT, SHARED, SINGLE-USE, ORPHAN, ESSENTIAL |
 | Removal simulation | Preview cascade effects before any system change |
 | Storage analysis | Home, $PREFIX, caches, proot-distro, per-category breakdown |
-| Cache cleanup | APT, pip, npm, cargo, gradle, pacman -- with interactive confirmation |
+| Cache cleanup | APT, pip, npm, cargo, gradle, pacman, uv -- with interactive confirmation |
 | File listing | Per-package files, largest files, lazy-populated on demand |
 | Health checks | Environment detection, dependency consistency, broken packages |
-| Dual backend | apt/dpkg (Debian/Termux) + pacman (Arch) with auto-detection |
+| Dual backend | apt/dpkg (Debian/Termux) + pacman (Arch) + uv (Python) with auto-detection |
 | JSON output | Every command supports --json for scripting |
-| Interactive TUI | Rich-based terminal UI with navigation, search, simulation |
+| Interactive TUI | curses-based terminal UI with auto-resize, scroll indicators, mouse+keyboard |
+| Delete operations | Storage file/folder deletion, package uninstall with simulation and confirmation |
 
 ## Installation Requirements
 
 - Python 3.10 or later
-- python-rich (for TUI and colored output)
-- dpkg-query or pacman (for package data)
+- dpkg-query, pacman, or uv (for package data)
 - No root required
 
 ## Supported Platforms

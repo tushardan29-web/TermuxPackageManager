@@ -118,6 +118,34 @@ def clean_gradle_cache(home=None, dry_run=False):
     return _clean_tree(path, dry_run, label="gradle")
 
 
+def clean_uv_cache(home=None, dry_run=False):
+    """Remove uv cache (wheel, http, git fallback)."""
+    home = home or os.path.expanduser("~")
+    result = CleanupResult()
+    cache_dir = os.path.join(home, ".cache", "uv")
+    if not os.path.isdir(cache_dir):
+        return result
+    # uv cache clean removes everything; we calculate size first
+    for entry in os.scandir(cache_dir):
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                sub = _clean_tree(entry.path, dry_run, label="uv")
+                result.cleaned_bytes += sub.cleaned_bytes
+                result.items_cleaned += sub.items_cleaned
+                result.errors.extend(sub.errors)
+            elif entry.is_file(follow_symlinks=False):
+                size = entry.stat(follow_symlinks=False).st_size
+                result.cleaned_bytes += size
+                result.items_cleaned += 1
+                if not dry_run:
+                    os.remove(entry.path)
+        except OSError as e:
+            result.errors.append(f"{entry.path}: {e}")
+    if not dry_run:
+        _run(["uv", "cache", "clean"])
+    return result
+
+
 def clean_orphans(db, dry_run=False):
     """Run apt autoremove / pacman -Rns for orphan packages."""
     from .core import load_state

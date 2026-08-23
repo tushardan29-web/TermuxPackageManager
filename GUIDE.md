@@ -588,7 +588,7 @@ claiming uninstalled dependencies, etc.
 ### `tpm tui`
 
 Launches the fully interactive terminal UI with mouse + keyboard support.
-Usage hints appear on every screen.
+Auto-resizes to fit terminal window. Usage hints appear on every screen.
 
 ```
 +----------------------------------------------------------+
@@ -605,6 +605,7 @@ Usage hints appear on every screen.
 |   orphans                    13 (115.2 MiB)              |
 |   cleanup potential          4.6 GiB                     |
 |   backend                    apt/dpkg                    |
+|   terminal                   80x24                       |
 |                                                          |
 +----------------------------------------------------------+
 |   p=Packages  d=Deps  s=Storage  o=Orphans  c=Cleanup    |
@@ -616,17 +617,15 @@ Usage hints appear on every screen.
 
 | Screen | Key | Description |
 |--------|-----|-------------|
-| Dashboard | (home) | Overview stats, navigation hub |
-| Package List | `p` | All packages with filtering, sorting, search |
-| Dep Browser | `d` | Browse packages by dependency count |
-| Storage | `s` | Directory tree with sizes, drill-down |
-| Orphans | `o` | Orphan packages, batch cleanup |
+| Dashboard | (home) | Overview stats, navigation hub, terminal size |
+| Package List | `p` | All packages with filtering, sorting, search, delete |
+| Dep Browser | `d` | Browse packages by dependency count, delete |
+| Storage | `s` | Directory tree with sizes, drill-down, file/folder delete |
+| Orphans | `o` | Orphan packages, batch cleanup, individual delete |
 | Cleanup | `c` | Cache detection, per-item selection and cleanup |
-| Search | `/` | Live search across packages |
+| Search | `/` | Live search across packages, delete |
 | Package Detail | Enter | Full info, deps, rdeps, files, simulation |
-| Dep Tree | `d` (from detail) | Recursive dependency tree |
-| RDep Tree | `R` (from detail) | Recursive reverse dependency tree |
-| Remove Confirm | (from detail) | Typed confirmation before removal |
+| Remove Confirm | `d`/Enter | Simulation display, typed confirmation before removal |
 
 ### Keyboard shortcuts (universal)
 
@@ -634,6 +633,7 @@ Usage hints appear on every screen.
 |-----|--------|
 | Arrow keys / `j`/`k` | Navigate up/down |
 | Enter | Select / drill-down |
+| `d` | Delete (with simulation + confirmation) |
 | `q` / Escape | Back / Quit |
 | `g` / Home | Jump to top |
 | `G` / End | Jump to bottom |
@@ -657,6 +657,7 @@ Usage hints appear on every screen.
 |-----|--------|
 | Arrow keys | Navigate |
 | Enter | Package detail |
+| `d` | Delete package (with simulation) |
 | `e` | Toggle: explicit only |
 | `s` | Toggle: shared only |
 | `o` | Toggle: orphans only |
@@ -669,8 +670,7 @@ Usage hints appear on every screen.
 | Key | Action |
 |-----|--------|
 | `r` | Toggle removal simulation |
-| `d` | Dependency tree |
-| `R` | Reverse dependency tree |
+| `d` | Delete package (with simulation) |
 | `f` | Toggle file list |
 | `q` | Back |
 
@@ -679,8 +679,8 @@ Usage hints appear on every screen.
 | Key | Action |
 |-----|--------|
 | Enter | Drill into directory |
+| `d` | Delete file/folder (with confirmation) |
 | `u` | Go up to parent |
-| `r` | Refresh |
 
 ### Cache/cleanup keys
 

@@ -1,181 +1,77 @@
-"""tpm TUI — fully functional interactive terminal interface.
+"""tpm TUI — built on curses for reliable input handling.
 
-Mouse + keyboard. Every CLI feature accessible. Security warnings
-before destructive actions. Usage hints on every screen.
+Design inspired by Fresh editor: clean panels, working mouse+keyboard,
+no stuck screens. Every screen has a status bar and usage hints.
 """
 
 from __future__ import annotations
 
+import curses
 import os
 import sys
 import time
-import select
-import signal
-import termios
-import tty
 from dataclasses import dataclass, field
-from typing import Any, Optional, List, Callable
-
-from rich.console import Console
-from rich.live import Live
-from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
-from rich.columns import Columns
-from rich.tree import Tree
-from rich.align import Align
-from rich.rule import Rule
-from rich import box
+from typing import Any, Optional, List
 
 from .core import load_state
 from .formatter import format_size
 from .package.backend import detect_backend
-from .storage.scanner import detect_caches, largest_dirs, scan_dir_size, classify_path
+from .storage.scanner import detect_caches, scan_dir_size, classify_path
 from .removal.simulator import simulate_removal
 from .database import Database
 
-# ── constants ────────────────────────────────────────────────────────────
+# ── colors ───────────────────────────────────────────────────────────────
 
-MOUSE_SGR = "\033[<"
-KEY_UP = "up"
-KEY_DOWN = "down"
-KEY_LEFT = "left"
-KEY_RIGHT = "right"
-KEY_ENTER = "enter"
-KEY_BACKSPACE = "backspace"
-KEY_DELETE = "delete"
-KEY_HOME = "home"
-KEY_END = "end"
-KEY_PAGE_UP = "page_up"
-KEY_PAGE_DOWN = "page_down"
-KEY_TAB = "tab"
-KEY_SHIFT_TAB = "shift_tab"
-KEY_MOUSE = "mouse"
+def _init_colors():
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)      # header
+    curses.init_pair(2, curses.COLOR_WHITE, -1)      # normal
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)     # warn
+    curses.init_pair(4, curses.COLOR_RED, -1)        # danger
+    curses.init_pair(5, curses.COLOR_GREEN, -1)      # safe
+    curses.init_pair(6, curses.COLOR_MAGENTA, -1)    # shared
+    curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_CYAN)    # selected
+    curses.init_pair(8, curses.COLOR_BLACK, curses.COLOR_WHITE)   # highlight
+    curses.init_pair(9, curses.COLOR_BLUE, -1)       # info
+    curses.init_pair(10, curses.COLOR_WHITE, curses.COLOR_RED)    # danger bg
 
-HINT_STYLE = "dim white on grey11"
-BORDER_STYLE = "bright_blue"
-SELECTED_STYLE = "bold white on grey15"
-HEADER_STYLE = "bold bright_cyan"
-WARN_STYLE = "bold yellow"
-DANGER_STYLE = "bold red"
-SAFE_STYLE = "bold green"
-INFO_STYLE = "dim cyan"
-
-
-# ── terminal input ──────────────────────────────────────────────────────
-
-def _raw_mode(fd):
-    old = termios.tcgetattr(fd)
-    tty.setcbreak(fd)
-    return old
+C_CYAN = 1
+C_WHITE = 2
+C_YELLOW = 3
+C_RED = 4
+C_GREEN = 5
+C_MAGENTA = 6
+C_SELECTED = 7
+C_HIGHLIGHT = 8
+C_BLUE = 9
+C_DANGER_BG = 10
 
 
-def _read_key(fd) -> Optional[str]:
-    """Read a single keypress, handling escape sequences for arrows,
-    function keys, mouse events, etc."""
-    if not _input_ready(fd, 0.05):
-        return None
-    ch = os.read(fd, 1)
-    if not ch:
-        return None
-    c = ch[0]
-    if c == 27:  # ESC sequence
-        if not _input_ready(fd, 0.05):
-            return "escape"
-        ch2 = os.read(fd, 1)
-        if not ch2:
-            return "escape"
-        c2 = ch2[0]
-        if c2 == 91:  # CSI [
-            ch3 = os.read(fd, 1)
-            if not ch3:
-                return None
-            c3 = ch3[0]
-            if c3 == 65:
-                return KEY_UP
-            if c3 == 66:
-                return KEY_DOWN
-            if c3 == 67:
-                return KEY_RIGHT
-            if c3 == 68:
-                return KEY_LEFT
-            if c3 == 72:
-                return KEY_HOME
-            if c3 == 70:
-                return KEY_END
-            if c3 == 53:
-                _input_ready(fd, 0.05)
-                os.read(fd, 1)
-                return KEY_PAGE_UP
-            if c3 == 54:
-                _input_ready(fd, 0.05)
-                os.read(fd, 1)
-                return KEY_PAGE_DOWN
-            if c3 == 90:
-                return KEY_SHIFT_TAB
-            # SGR mouse: ESC[<button;x;y M/m
-            if c3 == 60:
-                buf = b""
-                while True:
-                    if _input_ready(fd, 0.05):
-                        buf += os.read(fd, 1)
-                        if buf.endswith(b"M") or buf.endswith(b"m"):
-                            break
-                    else:
-                        break
-                return KEY_MOUSE
-        if c2 == 79:  # SS3
-            ch3 = os.read(fd, 1)
-            if ch3 and ch3[0] == 65:
-                return KEY_UP
-            if ch3 and ch3[0] == 66:
-                return KEY_DOWN
-        return None
-    if c == 127 or c == 8:
-        return KEY_BACKSPACE
-    if c == 13 or c == 10:
-        return KEY_ENTER
-    if c == 9:
-        return KEY_TAB
-    if c == 3:
-        return "ctrl-c"
-    if c == 4:
-        return "ctrl-d"
-    if c == 11:
-        return "ctrl-k"
-    if c == 12:
-        return "ctrl-l"
-    if c == 21:
-        return "ctrl-u"
-    if 32 <= c < 127:
-        return chr(c)
-    return None
-
-
-def _input_ready(fd, timeout):
-    r, _, _ = select.select([fd], [], [], timeout)
-    return bool(r)
-
-
-# ── data structures ──────────────────────────────────────────────────────
+# ── data ─────────────────────────────────────────────────────────────────
 
 @dataclass
-class Context:
-    console: Console
+class Ctx:
+    stdscr: Any
     state: Any = None
     db: Database = None
     caches: list = field(default_factory=list)
     status: str = ""
-    error: str = ""
-    no_color: bool = False
+    h: int = 0
+    w: int = 0
+
+    def ensure_db(self):
+        if self.db is None:
+            self.db = Database()
+        return self.db
 
     def ensure_state(self):
         if self.state is None:
-            self.db = self.db or Database()
+            self.ensure_db()
             try:
                 self.state = load_state(db=self.db)
             except Exception as e:
-                self.error = str(e)
+                self.status = f"error: {e}"
         return self.state
 
     def ensure_caches(self):
@@ -183,156 +79,204 @@ class Context:
             self.caches = detect_caches()
         return self.caches
 
-    def ensure_db(self):
-        if self.db is None:
-            self.db = Database()
-        return self.db
+    def refresh_size(self):
+        self.h, self.w = self.stdscr.getmaxyx()
 
 
 class Screen:
-    """Base screen. Subclasses implement render() and handle()."""
-    title: str = "Screen"
+    title = ""
+    hint = ""
 
-    def render(self, ctx: Context) -> Panel:
-        return Panel("nothing", title=self.title)
+    def __init__(self):
+        self.sel = 0
+        self.scroll = 0
 
-    def handle(self, key: str, ctx: Context) -> tuple:
-        """Return (action, ...) where action is one of:
-        ('stay',)       - stay on this screen
-        ('pop',)        - go back
-        ('push', screen) - push new screen
-        ('replace', screen) - replace current screen
-        ('quit',)       - exit TUI
-        ('status', msg) - show status message
-        """
-        return ("stay",)
+    def draw(self, ctx: Ctx):
+        pass
 
+    def key(self, ctx: Ctx, k: int) -> Optional[str]:
+        """Handle key. Return 'pop', 'quit', None (stay), or 'push:screen'."""
+        return None
 
-# ── rendering helpers ────────────────────────────────────────────────────
-
-def _header(ctx: Context, title: str, hint: str = "") -> Panel:
-    parts = [Text(f"  {title}", style=HEADER_STYLE)]
-    if hint:
-        parts.append(Text(f"  {hint}", style=HINT_STYLE))
-    return Panel(Columns(parts, expand=True), style=BORDER_STYLE, box=box.DOUBLE)
-
-
-def _footer(ctx: Context, hint: str) -> Panel:
-    return Panel(Text(f"  {hint}", style=HINT_STYLE), style=BORDER_STYLE, box=box.ROUNDED)
-
-
-def _page(ctx: Context, title: str, body, hint: str, status: str = "") -> Table:
-    grid = Table.grid(expand=True, padding=0)
-    grid.add_column()
-    grid.add_row(_header(ctx, title, status or ctx.status))
-    grid.add_row(body)
-    grid.add_row(_footer(ctx, hint))
-    return grid
-
-
-def _scrollable_list(items: list, sel: int, height: int = 20,
-                     render_row: Optional[Callable] = None) -> Table:
-    """Render a scrollable list with selection highlight."""
-    if not items:
-        return Panel(Text("  (empty)", style="dim"), box=box.ROUNDED)
-    sel = max(0, min(sel, len(items) - 1))
-    start = max(0, sel - height // 2)
-    end = min(len(items), start + height)
-    start = max(0, end - height)
-
-    table = Table(box=box.SIMPLE_HEAVY, show_header=False, expand=True,
-                  padding=(0, 1))
-    table.add_column("sel", width=3)
-    table.add_column("content", ratio=1)
-
-    for i in range(start, end):
-        prefix = " > " if i == sel else "   "
-        style = SELECTED_STYLE if i == sel else ""
-        if render_row:
-            content = render_row(items[i], i == sel)
+    def _clamp_sel(self, count):
+        if count == 0:
+            self.sel = 0
         else:
-            content = str(items[i])
-        table.add_row(prefix, Text(content, style=style))
+            self.sel = max(0, min(self.sel, count - 1))
 
-    scroll_info = f" {sel + 1}/{len(items)}"
-    return Table(
-        Table(table, expand=True),
-        Text(scroll_info, style="dim"),
-        box=box.ROUNDED, expand=True
-    )
+    def _clamp_scroll(self, count, visible):
+        if count <= visible:
+            self.scroll = 0
+        else:
+            self.scroll = max(0, min(self.scroll, count - visible))
+            if self.sel < self.scroll:
+                self.scroll = self.sel
+            elif self.sel >= self.scroll + visible:
+                self.scroll = self.sel - visible + 1
+
+    def _draw_bar(self, ctx: Ctx, y, text, style=curses.A_NORMAL):
+        ctx.stdscr.addnstr(y, 0, text.ljust(ctx.w), ctx.w - 1, style)
+
+    def _draw_header(self, ctx: Ctx):
+        title = f" {self.title} "
+        if ctx.w < len(title) + 10:
+            title = title[:ctx.w - 4] + ".."
+        self._draw_bar(ctx, 0, title, curses.color_pair(C_CYAN) | curses.A_BOLD)
+
+    def _draw_footer(self, ctx: Ctx):
+        hint = f" {self.hint} "
+        if ctx.w < len(hint) + 4:
+            hint = hint[:ctx.w - 4] + ".."
+        self._draw_bar(ctx, ctx.h - 1, hint, curses.color_pair(C_BLUE))
+
+    def _draw_status(self, ctx: Ctx):
+        if ctx.status:
+            self._draw_bar(ctx, ctx.h - 2, f" {ctx.status}",
+                           curses.color_pair(C_YELLOW))
+
+    def _draw_list(self, ctx: Ctx, items, start_y, height, render_fn):
+        """Draw a scrollable list with overflow indicators.
+        render_fn(item, selected) -> (text, attr)."""
+        visible = height
+        self._clamp_sel(len(items))
+        self._clamp_scroll(len(items), visible)
+
+        # scroll indicators
+        has_above = self.scroll > 0
+        has_below = self.scroll + visible < len(items)
+
+        for i in range(visible):
+            idx = self.scroll + i
+            y = start_y + i
+            if y >= ctx.h - 2:
+                break
+            if idx < len(items):
+                text, attr = render_fn(items[idx], idx == self.sel)
+                cursor = ">" if idx == self.sel else " "
+                line = f"{cursor} {text}"
+                ctx.stdscr.addnstr(y, 0, line, ctx.w - 1, attr)
+            else:
+                ctx.stdscr.addnstr(y, 0, "", ctx.w - 1)
+
+        # overflow indicators on the right edge
+        if has_above:
+            ctx.stdscr.addnstr(start_y - 1 if start_y > 0 else 0,
+                               ctx.w - 3, "^^", 2,
+                               curses.color_pair(C_YELLOW) | curses.A_BOLD)
+        if has_below:
+            y_ind = start_y + min(visible, len(items) - self.scroll)
+            if y_ind < ctx.h - 2:
+                ctx.stdscr.addnstr(y_ind, ctx.w - 3, "vv", 2,
+                                   curses.color_pair(C_YELLOW) | curses.A_BOLD)
+
+    def _is_enter(self, k):
+        return k in (curses.KEY_ENTER, 10, 13)
+
+    def _is_up(self, k):
+        return k == curses.KEY_UP or k == ord('k')
+
+    def _is_down(self, k):
+        return k == curses.KEY_DOWN or k == ord('j')
+
+    def _is_pageup(self, k):
+        return k == curses.KEY_PPAGE
+
+    def _is_pagedown(self, k):
+        return k == curses.KEY_NPAGE
+
+    def _is_home(self, k):
+        return k == curses.KEY_HOME or k == ord('g')
+
+    def _is_end(self, k):
+        return k == curses.KEY_END or k == ord('G')
 
 
 # ── screens ──────────────────────────────────────────────────────────────
 
-class DashboardScreen(Screen):
-    title = "Dashboard"
-    hint = "p=Packages  d=Deps  s=Storage  o=Orphans  c=Cleanup  /=Search  q=Quit"
+class Dashboard(Screen):
+    title = "TPM - Termux Package Manager"
+    hint = "p:Packages  d:Deps  s:Storage  o:Orphans  c:Cleanup  /:Search  q:Quit"
 
-    def render(self, ctx):
+    def draw(self, ctx: Ctx):
+        self._draw_header(ctx)
         state = ctx.ensure_state()
         ctx.ensure_caches()
+        y = 2
         if not state:
-            return _page(ctx, self.title,
-                         Panel(Text(ctx.error or "no data", style="red")),
-                         self.hint)
+            ctx.stdscr.addnstr(y, 2, f"Error: {ctx.status or 'no data'}", ctx.w - 4, curses.color_pair(C_RED))
+            self._draw_footer(ctx)
+            return
 
         pkgs = state.graph.packages
         total = sum((p["installed_size"] or 0) for p in pkgs.values())
-        cache_bytes = sum((c.get("size") or 0) for c in ctx.caches)
-        explicit = {n for n in pkgs if n in state.explicit}
-        orphan_names = [n for n in pkgs if state.classification(n)[0] == "ORPHAN"]
-        orphan_bytes = sum((pkgs[n]["installed_size"] or 0) for n in orphan_names)
+        cache_b = sum((c.get("size") or 0) for c in ctx.caches)
+        explicit = sum(1 for n in pkgs if n in state.explicit)
+        orphans = [n for n in pkgs if state.classification(n)[0] == "ORPHAN"]
+        orphan_b = sum((pkgs[n]["installed_size"] or 0) for n in orphans)
         shared = sum(1 for n in pkgs if state.classification(n)[0] == "SHARED")
         single = sum(1 for n in pkgs if state.classification(n)[0] == "SINGLE-USE")
 
         rows = [
-            ("packages", str(len(pkgs))),
-            ("installed size", format_size(total)),
-            ("caches", format_size(cache_bytes)),
-            ("explicit", str(len(explicit))),
-            ("essential", str(len(state.essential))),
-            ("shared deps", str(shared)),
-            ("single-use", str(single)),
-            (f"orphans", f"{len(orphan_names)} ({format_size(orphan_bytes)})"),
-            ("cleanup potential", format_size(cache_bytes + orphan_bytes)),
-            ("backend", state.backend_name),
+            ("Packages", str(len(pkgs))),
+            ("Installed size", format_size(total)),
+            ("Caches", format_size(cache_b)),
+            ("Explicit", str(explicit)),
+            ("Essential", str(len(state.essential))),
+            ("Shared deps", str(shared)),
+            ("Single-use", str(single)),
+            ("Orphans", f"{len(orphans)} ({format_size(orphan_b)})"),
+            ("Cleanup potential", format_size(cache_b + orphan_b)),
+            ("Backend", state.backend_name),
+            ("Terminal", f"{ctx.w}x{ctx.h}"),
         ]
 
-        t = Table(box=box.SIMPLE, show_header=False, expand=True, padding=(0, 2))
-        t.add_column("label", style="dim", ratio=1)
-        t.add_column("value", style="bold", ratio=2)
-        for label, value in rows:
-            t.add_row(label, value)
+        max_label = max(len(r[0]) for r in rows) + 2
+        visible_rows = 0
+        for label, val in rows:
+            if y >= ctx.h - 2:
+                break
+            ctx.stdscr.addnstr(y, 4, label.ljust(max_label), ctx.w - 6,
+                               curses.color_pair(C_WHITE))
+            ctx.stdscr.addnstr(y, 4 + max_label, val, ctx.w - 4 - max_label,
+                               curses.color_pair(C_CYAN) | curses.A_BOLD)
+            y += 1
+            visible_rows += 1
 
-        return _page(ctx, self.title, t, self.hint)
+        if visible_rows < len(rows):
+            ctx.stdscr.addnstr(y, 4, f"... +{len(rows) - visible_rows} more",
+                               ctx.w - 6, curses.color_pair(C_YELLOW))
 
-    def handle(self, key, ctx):
-        if key == "p":
-            return ("push", PackageListScreen())
-        if key == "d":
-            return ("push", DepBrowserScreen())
-        if key == "s":
-            return ("push", StorageScreen())
-        if key == "o":
-            return ("push", OrphanScreen())
-        if key == "c":
-            return ("push", CacheScreen())
-        if key == "/":
-            return ("push", SearchScreen())
-        return ("stay",)
+        self._draw_footer(ctx)
+
+    def key(self, ctx, k):
+        if k == ord('q'):
+            return "quit"
+        if k == ord('p'):
+            return "push:pkglist"
+        if k == ord('d'):
+            return "push:depbrowser"
+        if k == ord('s'):
+            return "push:storage"
+        if k == ord('o'):
+            return "push:orphans"
+        if k == ord('c'):
+            return "push:cache"
+        if k == ord('/'):
+            return "push:search"
+        return None
 
 
-class PackageListScreen(Screen):
+class PkgList(Screen):
     title = "Packages"
-    hint = "arrows=move  Enter=info  e/s/o/x=filter  /=search  r=rescan  q=back"
+    hint = "j/k:move  Enter:info  d:delete  e/s/o/x:filter  /:search  r:rescan  q:back"
 
     def __init__(self, mode="all", search=""):
-        self.mode = mode  # all, explicit, shared, orphans
+        super().__init__()
+        self.mode = mode
         self.search = search
-        self.sel = 0
         self.items = []
-        self.input_buf = ""
-        self.input_mode = False
+        self._input_buf = ""
+        self._input_mode = False
 
     def _load(self, ctx):
         state = ctx.ensure_state()
@@ -352,314 +296,312 @@ class PackageListScreen(Screen):
             self.items.append((name, row, cls, cnt))
         self.items.sort(key=lambda x: -(x[1].get("installed_size") or 0))
 
-    def render(self, ctx):
+    def draw(self, ctx):
         self._load(ctx)
-        state = ctx.ensure_state()
-        filter_label = f" [{self.mode.upper()}]" if self.mode != "all" else ""
-        search_label = f" /{self.search}" if self.search else ""
-        status = f"{len(self.items)} packages{filter_label}{search_label}"
+        self._draw_header(ctx)
 
-        if not self.items:
-            body = Panel(Text("  no matching packages", style="dim"), box=box.ROUNDED)
-            return _page(ctx, self.title, body, self.hint, status)
+        # status line
+        filt = f" [{self.mode.upper()}]" if self.mode != "all" else ""
+        srch = f" /{self.search}" if self.search else ""
+        status = f" {len(self.items)} packages{filt}{srch}"
+        ctx.stdscr.addnstr(1, 0, status.ljust(ctx.w), ctx.w - 1,
+                           curses.color_pair(C_WHITE))
 
-        def row_renderer(item, selected):
+        # input line
+        if self._input_mode:
+            ctx.stdscr.addnstr(2, 0, f" search: {self._input_buf}_".ljust(ctx.w),
+                               ctx.w - 1, curses.color_pair(C_YELLOW) | curses.A_BOLD)
+            start_y = 3
+        else:
+            start_y = 2
+
+        # list
+        def render(item, sel):
             name, row, cls, cnt = item
             size = format_size(row.get("installed_size") or 0)
             label = f"SHARED x{cnt}" if cls == "SHARED" else cls
-            return Text.assemble(
-                (f"{name:<30}", "bold" if selected else ""),
-                (f"{size:>10}", ""),
-                (f"  {label}", f"{'bold cyan' if cls == 'EXPLICIT' else 'magenta' if cls == 'SHARED' else 'red' if cls == 'ORPHAN' else 'dim'}")
-            )
+            attr = curses.color_pair(C_WHITE)
+            if cls == "EXPLICIT":
+                label_attr = curses.color_pair(C_CYAN) | curses.A_BOLD
+            elif cls == "SHARED":
+                label_attr = curses.color_pair(C_MAGENTA)
+            elif cls == "ORPHAN":
+                label_attr = curses.color_pair(C_RED)
+            elif cls == "ESSENTIAL":
+                label_attr = curses.color_pair(C_YELLOW)
+            else:
+                label_attr = curses.color_pair(C_WHITE)
+            if sel:
+                attr = curses.color_pair(C_SELECTED) | curses.A_BOLD
+            # We return raw text; color is applied via attribute
+            text = f"{name:<28} {size:>10}  {label}"
+            return text, attr
 
-        items_text = []
-        for item in self.items:
-            name, row, cls, cnt = item
-            size = format_size(row.get("installed_size") or 0)
-            label = f"SHARED x{cnt}" if cls == "SHARED" else cls
-            items_text.append((name, size, label, cls, cnt))
+        self._draw_list(ctx, self.items, start_y, ctx.h - 4, render)
+        self._draw_footer(ctx)
 
-        table = Table(box=box.SIMPLE_HEAVY, show_header=True, expand=True,
-                      padding=(0, 1), show_lines=False)
-        table.add_column("", width=3)
-        table.add_column("NAME", ratio=3)
-        table.add_column("SIZE", ratio=1, justify="right")
-        table.add_column("TYPE", ratio=2)
-
-        sel = max(0, min(self.sel, len(self.items) - 1))
-        height = ctx.console.height - 6
-        start = max(0, sel - height // 2)
-        end = min(len(self.items), start + height)
-        start = max(0, end - height)
-
-        for i in range(start, end):
-            name, size, label, cls, cnt = items_text[i]
-            prefix = " > " if i == sel else "   "
-            cls_style = ("bold cyan" if cls == "EXPLICIT" else
-                         "magenta" if cls == "SHARED" else
-                         "red" if cls == "ORPHAN" else
-                         "yellow" if cls == "ESSENTIAL" else "dim")
-            table.add_row(
-                Text(prefix, style=SELECTED_STYLE if i == sel else ""),
-                Text(name, style="bold" if i == sel else ""),
-                Text(size),
-                Text(label, style=cls_style)
-            )
-
-        scroll = Text(f"  {sel + 1}/{len(self.items)}", style="dim")
-        body = Table(table, scroll, box=box.ROUNDED, expand=True)
-
-        if self.input_mode:
-            input_panel = Panel(
-                Text(f"  search: {self.input_buf}_", style="bold"),
-                title="Search", border_style="yellow", box=box.ROUNDED)
-            body = Table(input_panel, body, box=None, expand=True)
-
-        return _page(ctx, self.title, body, self.hint, status)
-
-    def handle(self, key, ctx):
-        if self.input_mode:
-            if key == KEY_ENTER:
-                self.search = self.input_buf
-                self.input_mode = False
+    def key(self, ctx, k):
+        if self._input_mode:
+            if k == 27:  # ESC
+                self._input_mode = False
+                return None
+            if k in (curses.KEY_ENTER, 10, 13):
+                self.search = self._input_buf
+                self._input_mode = False
                 self.sel = 0
-                return ("stay",)
-            if key == KEY_ESCAPE or key == "ctrl-c":
-                self.input_mode = False
-                return ("stay",)
-            if key == KEY_BACKSPACE:
-                self.input_buf = self.input_buf[:-1]
-                return ("stay",)
-            if key and len(key) == 1 and key.isprintable():
-                self.input_buf += key
-                return ("stay",)
-            return ("stay",)
+                return None
+            if k in (curses.KEY_BACKSPACE, 127, 8):
+                self._input_buf = self._input_buf[:-1]
+                return None
+            if 32 <= k < 127:
+                self._input_buf += chr(k)
+                return None
+            return None
 
-        if key == "/":
-            self.input_mode = True
-            self.input_buf = ""
-            return ("stay",)
-        if key == KEY_UP or key == "k":
-            self.sel = max(0, self.sel - 1)
-            return ("stay",)
-        if key == KEY_DOWN or key == "j":
-            self.sel = min(len(self.items) - 1, self.sel + 1)
-            return ("stay",)
-        if key == KEY_HOME or key == "g":
+        if k == ord('/'):
+            self._input_mode = True
+            self._input_buf = ""
+            return None
+        if k == ord('q'):
+            return "pop"
+        if self._is_up(k):
+            self.sel -= 1
+            return None
+        if self._is_down(k):
+            self.sel += 1
+            return None
+        if self._is_pageup(k):
+            self.sel -= 20
+            return None
+        if self._is_pagedown(k):
+            self.sel += 20
+            return None
+        if self._is_home(k):
             self.sel = 0
-            return ("stay",)
-        if key == KEY_END or key == "G":
-            self.sel = max(0, len(self.items) - 1)
-            return ("stay",)
-        if key == KEY_PAGE_UP:
-            self.sel = max(0, self.sel - 20)
-            return ("stay",)
-        if key == KEY_PAGE_DOWN:
-            self.sel = min(len(self.items) - 1, self.sel + 20)
-            return ("stay",)
-        if key == KEY_ENTER and self.items:
+            return None
+        if self._is_end(k):
+            self.sel = len(self.items) - 1
+            return None
+        if self._is_enter(k) and self.items:
             name = self.items[self.sel][0]
-            return ("push", PackageDetailScreen(name))
-        if key == "e":
+            return f"push:detail:{name}"
+        if k == ord('e'):
             self.mode = "explicit" if self.mode != "explicit" else "all"
             self.sel = 0
-            return ("stay",)
-        if key == "s":
+            return None
+        if k == ord('s'):
             self.mode = "shared" if self.mode != "shared" else "all"
             self.sel = 0
-            return ("stay",)
-        if key == "o":
+            return None
+        if k == ord('o'):
             self.mode = "orphans" if self.mode != "orphans" else "all"
             self.sel = 0
-            return ("stay",)
-        if key == "x":
+            return None
+        if k == ord('x'):
             self.mode = "all"
             self.sel = 0
-            return ("stay",)
-        if key == "r":
+            return None
+        if k == ord('r'):
             from .scanner import run_scan
             run_scan(db=ctx.db)
             ctx.state = None
-            ctx.ensure_state()
-            return ("status", "rescan complete")
-        return ("stay",)
+            ctx.status = "rescan complete"
+            return None
+        if k == ord('d') and self.items:
+            name = self.items[self.sel][0]
+            return f"push:confirm:{name}"
+        return None
 
 
-class PackageDetailScreen(Screen):
+class Detail(Screen):
     title = "Package"
-    hint = "r=simulate  d=deps  R=rdeps  f=files  q=back"
+    hint = "r:simulate  d:deps  R:rdeps  f:files  q:back"
 
     def __init__(self, name):
+        super().__init__()
         self.name = name
-        self.sim_result = None
+        self.sim = None
         self.show_files = False
-        self.file_items = []
+        self.files = []
+        self.tab = 0  # 0=info, 1=deps, 2=rdeps, 3=files
 
-    def render(self, ctx):
+    def draw(self, ctx):
         state = ctx.ensure_state()
+        self.title = self.name
+        self._draw_header(ctx)
+
         if not state or self.name not in state.graph.packages:
-            return _page(ctx, self.title,
-                         Panel(Text(f"  not found: {self.name}", style="red")),
-                         "q=back")
+            ctx.stdscr.addnstr(2, 2, f"Not found: {self.name}", ctx.w - 4,
+                               curses.color_pair(C_RED))
+            self._draw_footer(ctx)
+            return
 
         row = state.graph.packages[self.name]
         cls, cnt = state.classification(self.name)
         label = f"SHARED x{cnt}" if cls == "SHARED" else cls
-        cls_style = ("bold cyan" if cls == "EXPLICIT" else
-                     "magenta" if cls == "SHARED" else
-                     "red" if cls == "ORPHAN" else
-                     "yellow" if cls == "ESSENTIAL" else "dim")
+        y = 2
 
-        # info
-        info = Table(box=box.SIMPLE, show_header=False, expand=True, padding=(0, 1))
-        info.add_column("k", style="dim", ratio=1)
-        info.add_column("v", ratio=3)
-        info.add_row("Name", Text(self.name, style="bold"))
-        info.add_row("Version", str(row.get("version") or ""))
-        info.add_row("Architecture", str(row.get("architecture") or ""))
-        info.add_row("Size", format_size(row.get("installed_size") or 0))
-        info.add_row("Type", Text(label, style=cls_style))
-        info.add_row("Essential", "yes" if row.get("essential") else "no")
+        # info block
+        info_lines = [
+            ("Name", self.name),
+            ("Version", str(row.get("version") or "")),
+            ("Arch", str(row.get("architecture") or "")),
+            ("Size", format_size(row.get("installed_size") or 0)),
+            ("Type", label),
+            ("Essential", "yes" if row.get("essential") else "no"),
+        ]
+        for lbl, val in info_lines:
+            if y >= ctx.h - 3:
+                break
+            ctx.stdscr.addnstr(y, 2, f"{lbl}:", 12, curses.color_pair(C_WHITE))
+            ctx.stdscr.addnstr(y, 14, val, ctx.w - 16, curses.color_pair(C_CYAN))
+            y += 1
 
-        db = ctx.ensure_db()
-        fcount = None
-        if db:
-            try:
-                if not db.files_populated(self.name):
-                    backend = detect_backend()
-                    if backend:
-                        fl = backend.file_list(self.name)
-                        db.populate_files(self.name, fl)
-                fcount = db.file_count(self.name)
-            except Exception:
-                pass
-        info.add_row("Files", str(fcount) if fcount else "?")
+        y += 1
+        # tabs
+        tabs = ["Info", "Deps", "Rdeps", "Files"]
+        tab_line = " ".join(
+            f"[{('>' if i == self.tab else ' ')} {t}]" for i, t in enumerate(tabs))
+        ctx.stdscr.addnstr(y, 2, tab_line, ctx.w - 4,
+                           curses.color_pair(C_YELLOW))
+        y += 1
 
-        # deps
-        deps = state.graph.direct_deps(self.name)
-        dep_lines = []
-        for d in deps:
-            if d in state.graph.packages:
-                dc, dcnt = state.classification(d)
-                dl = f"SHARED x{dcnt}" if dc == "SHARED" else dc
-                dep_lines.append(f"  {d}  [{dl}]")
-        if not dep_lines:
-            dep_lines = ["  (none)"]
-        deps_panel = Panel(
-            Text("\n".join(dep_lines), overflow="fold"),
-            title=f"Deps ({len(deps)})",
-            border_style=BORDER_STYLE, box=box.ROUNDED)
+        # tab content
+        if self.tab == 1:  # deps
+            deps = state.graph.direct_deps(self.name)
+            shown = 0
+            for d in deps:
+                if y >= ctx.h - 3:
+                    break
+                if d in state.graph.packages:
+                    dc, dcnt = state.classification(d)
+                    dl = f"SHARED x{dcnt}" if dc == "SHARED" else dc
+                    ctx.stdscr.addnstr(y, 4, f"{d}", ctx.w - 20,
+                                       curses.color_pair(C_WHITE))
+                    ctx.stdscr.addnstr(y, ctx.w - 16, dl, 14,
+                                       curses.color_pair(C_MAGENTA if dc == "SHARED" else C_WHITE))
+                y += 1
+                shown += 1
+            if shown < len(deps):
+                ctx.stdscr.addnstr(y, 4, f"... +{len(deps) - shown} more deps",
+                                   ctx.w - 6, curses.color_pair(C_YELLOW))
+            elif not deps:
+                ctx.stdscr.addnstr(y, 4, "(none)", ctx.w - 6,
+                                   curses.color_pair(C_WHITE))
 
-        # rdeps
-        rdeps = state.graph.direct_rdeps(self.name)
-        rdep_lines = []
-        for r in rdeps:
-            if r in state.graph.packages:
-                rc, rcnt = state.classification(r)
-                rl = f"SHARED x{rcnt}" if rc == "SHARED" else rc
-                rdep_lines.append(f"  {r}  [{rl}]")
-        if not rdep_lines:
-            rdep_lines = ["  (nothing depends on this)"]
-        rdeps_panel = Panel(
-            Text("\n".join(rdep_lines), overflow="fold"),
-            title=f"Required by ({len(rdeps)})",
-            border_style=BORDER_STYLE, box=box.ROUNDED)
+        elif self.tab == 2:  # rdeps
+            rdeps = state.graph.direct_rdeps(self.name)
+            shown = 0
+            for r in rdeps:
+                if y >= ctx.h - 3:
+                    break
+                ctx.stdscr.addnstr(y, 4, r, ctx.w - 6,
+                                   curses.color_pair(C_WHITE))
+                y += 1
+                shown += 1
+            if shown < len(rdeps):
+                ctx.stdscr.addnstr(y, 4, f"... +{len(rdeps) - shown} more rdeps",
+                                   ctx.w - 6, curses.color_pair(C_YELLOW))
+            elif not rdeps:
+                ctx.stdscr.addnstr(y, 4, "(nothing depends on this)",
+                                   ctx.w - 6, curses.color_pair(C_WHITE))
 
-        cols = Columns([deps_panel, rdeps_panel], equal=True, expand=True)
-
-        # simulation
-        sim_body = None
-        if self.sim_result:
-            sim = self.sim_result
-            sim_lines = [Text(f"  Requested: {', '.join(sim.requested)}", style=WARN_STYLE)]
-            if sim.cascade_removable:
-                sim_lines.append(Text(f"  Would remove: {len(sim.cascade_removable)} packages",
-                                      style=DANGER_STYLE))
-                for n in sim.cascade_removable[:10]:
-                    sim_lines.append(Text(f"    {n}", style="dim"))
-                if len(sim.cascade_removable) > 10:
-                    sim_lines.append(Text(f"    ... and {len(sim.cascade_removable) - 10} more",
-                                          style="dim"))
-            if sim.retained_shared:
-                sim_lines.append(Text(f"  Retained (shared): {len(sim.retained_shared)} packages",
-                                      style=SAFE_STYLE))
-            if sim.broken:
-                sim_lines.append(Text(f"  BROKEN: {len(sim.broken)} packages",
-                                      style=DANGER_STYLE))
-                for b in sim.broken[:5]:
-                    sim_lines.append(Text(f"    {b}", style=DANGER_STYLE))
-            if sim.blocked_reasons:
-                for r in sim.blocked_reasons:
-                    sim_lines.append(Text(f"  blocked: {r}", style=WARN_STYLE))
-            sim_lines.append(Text(f"  Recovery: {format_size(sim.total_recovery_bytes)}",
-                                  style=SAFE_STYLE))
-            sim_body = Panel(
-                Text("\n".join(str(s) for s in sim_lines), overflow="fold"),
-                title="Removal Simulation",
-                border_style="yellow", box=box.DOUBLE)
-
-        # files
-        files_body = None
-        if self.show_files and self.file_items:
-            ft = Table(box=box.SIMPLE_HEAVY, show_header=False, expand=True)
-            ft.add_column("size", justify="right", style="dim")
-            ft.add_column("path", ratio=1)
-            for fp, fs in self.file_items[:30]:
-                ft.add_row(format_size(fs) if fs else "", fp)
-            files_body = Panel(ft, title=f"Files ({len(self.file_items)})",
-                               border_style=BORDER_STYLE, box=box.ROUNDED)
-
-        # action buttons
-        btns = Table(box=box.SIMPLE, show_header=False, expand=True)
-        btns.add_column("btn", ratio=1)
-        btns.add_column("desc", ratio=3)
-        btns.add_row(Text(" [r] ", style="bold yellow"), Text("Simulate removal"))
-        btns.add_row(Text(" [d] ", style="bold cyan"), Text("Dependency tree"))
-        btns.add_row(Text(" [R] ", style="bold cyan"), Text("Reverse dependency tree"))
-        btns.add_row(Text(" [f] ", style="bold cyan"), Text("Toggle file list"))
-        btns_panel = Panel(btns, title="Actions", border_style=BORDER_STYLE, box=box.ROUNDED)
-
-        # assemble
-        body = Table(box=None, expand=True, padding=0)
-        body.add_column()
-        body.add_row(info)
-        body.add_row(Text(""))
-        body.add_row(cols)
-        if sim_body:
-            body.add_row(sim_body)
-        if files_body:
-            body.add_row(files_body)
-        body.add_row(btns_panel)
-
-        hint = self.hint
-        if self.sim_result:
-            hint += "  R=clear simulation"
-        return _page(ctx, f"{self.name}", body, hint)
-
-    def handle(self, key, ctx):
-        state = ctx.ensure_state()
-        if not state or self.name not in state.graph.packages:
-            if key in ("q", KEY_ESCAPE):
-                return ("pop",)
-            return ("stay",)
-        if key == "q" or key == KEY_ESCAPE:
-            return ("pop",)
-        if key == "r":
-            if self.sim_result is None:
-                self.sim_result = simulate_removal(
-                    state.graph, [self.name],
-                    explicit_set=state.explicit,
-                    essential_set=state.essential)
+        elif self.tab == 3:  # files
+            if self.files:
+                shown = 0
+                for fp, fs in self.files[:ctx.h - 6]:
+                    if y >= ctx.h - 3:
+                        break
+                    sz = format_size(fs) if fs else ""
+                    ctx.stdscr.addnstr(y, 4, f"{sz:>10}  {fp}", ctx.w - 6,
+                                       curses.color_pair(C_WHITE))
+                    y += 1
+                    shown += 1
+                if shown < len(self.files):
+                    ctx.stdscr.addnstr(y, 4, f"... +{len(self.files) - shown} more files",
+                                       ctx.w - 6, curses.color_pair(C_YELLOW))
             else:
-                self.sim_result = None
-            return ("stay",)
-        if key == "d":
-            return ("push", TreeScreen(self.name, "deps"))
-        if key == "R":
-            return ("push", TreeScreen(self.name, "rdeps"))
-        if key == "f":
-            if not self.show_files:
+                ctx.stdscr.addnstr(y, 4, "(press f to load files)", ctx.w - 6,
+                                   curses.color_pair(C_WHITE))
+
+        else:  # info (tab 0) - show simulation if active
+            if self.sim:
+                sim = self.sim
+                ctx.stdscr.addnstr(y, 2, "SIMULATION:", ctx.w - 4,
+                                   curses.color_pair(C_YELLOW) | curses.A_BOLD)
+                y += 1
+                ctx.stdscr.addnstr(y, 4, f"Remove: {', '.join(sim.requested)}",
+                                   ctx.w - 6, curses.color_pair(C_RED))
+                y += 1
+                if sim.cascade_removable:
+                    ctx.stdscr.addnstr(y, 4,
+                                       f"Cascade: {len(sim.cascade_removable)} packages",
+                                       ctx.w - 6, curses.color_pair(C_YELLOW))
+                    y += 1
+                    for n in sim.cascade_removable[:5]:
+                        if y >= ctx.h - 3:
+                            break
+                        ctx.stdscr.addnstr(y, 6, n, ctx.w - 8,
+                                           curses.color_pair(C_WHITE))
+                        y += 1
+                    if len(sim.cascade_removable) > 5:
+                        ctx.stdscr.addnstr(y, 6,
+                                           f"... and {len(sim.cascade_removable) - 5} more",
+                                           ctx.w - 8, curses.color_pair(C_WHITE))
+                        y += 1
+                if sim.retained_shared:
+                    ctx.stdscr.addnstr(y, 4,
+                                       f"Retained: {len(sim.retained_shared)} shared",
+                                       ctx.w - 6, curses.color_pair(C_GREEN))
+                    y += 1
+                if sim.broken:
+                    ctx.stdscr.addnstr(y, 4, f"BROKEN: {len(sim.broken)}",
+                                       ctx.w - 6, curses.color_pair(C_RED) | curses.A_BOLD)
+                    y += 1
+                ctx.stdscr.addnstr(y, 4,
+                                   f"Recovery: {format_size(sim.total_recovery_bytes)}",
+                                   ctx.w - 6, curses.color_pair(C_GREEN))
+            else:
+                ctx.stdscr.addnstr(y, 2, "Press 'r' to simulate removal",
+                                   ctx.w - 4, curses.color_pair(C_WHITE))
+
+        self._draw_footer(ctx)
+
+    def key(self, ctx, k):
+        if k == ord('q'):
+            return "pop"
+        if k == ord('1'):
+            self.tab = 0
+            return None
+        if k == ord('2'):
+            self.tab = 1
+            return None
+        if k == ord('3'):
+            self.tab = 2
+            return None
+        if k == ord('4'):
+            self.tab = 3
+            return None
+        if k == ord('r'):
+            if self.sim is None:
+                state = ctx.ensure_state()
+                if state and self.name in state.graph.packages:
+                    self.sim = simulate_removal(
+                        state.graph, [self.name],
+                        explicit_set=state.explicit,
+                        essential_set=state.essential)
+                    self.tab = 0
+            else:
+                self.sim = None
+            return None
+        if k == ord('d'):
+            self.tab = 1
+            return None
+        if k == ord('R'):
+            self.tab = 2
+            return None
+        if k == ord('f'):
+            if not self.files:
                 db = ctx.ensure_db()
                 if db:
                     if not db.files_populated(self.name):
@@ -667,7 +609,7 @@ class PackageDetailScreen(Screen):
                         if backend:
                             fl = backend.file_list(self.name)
                             db.populate_files(self.name, fl)
-                    self.file_items = [
+                    self.files = [
                         (r["path"], r["size"])
                         for r in db.conn.execute(
                             "SELECT path, size FROM files f JOIN packages p "
@@ -675,177 +617,222 @@ class PackageDetailScreen(Screen):
                             "ORDER BY COALESCE(size,0) DESC",
                             (self.name,)).fetchall()
                     ]
-            self.show_files = not self.show_files
-            return ("stay",)
-        return ("stay",)
+            self.tab = 3
+            return None
+        if k == ord('c'):
+            # confirm removal
+            return f"push:confirm:{self.name}"
+        return None
 
 
-class TreeScreen(Screen):
-    title = "Tree"
+class ConfirmRemoval(Screen):
+    title = "Confirm Removal"
+    hint = "Type 'yes' to confirm, any other key to cancel"
 
-    def __init__(self, name, mode="deps"):
+    def __init__(self, name):
+        super().__init__()
         self.name = name
-        self.mode = mode  # deps or rdeps
-        self.sel = 0
-        self.items = []
+        self.buf = ""
+        self.done = False
+        self.result = ""
 
-    def _load(self, ctx):
+    def draw(self, ctx):
+        self._draw_header(ctx)
         state = ctx.ensure_state()
-        if not state or self.name not in state.graph.packages:
-            return
-        if self.mode == "deps":
-            self.items = state.graph.recursive_deps(self.name)
+        y = 2
+
+        sim = None
+        if state and self.name in state.graph.packages:
+            sim = simulate_removal(
+                state.graph, [self.name],
+                explicit_set=state.explicit,
+                essential_set=state.essential)
+
+        if sim:
+            ctx.stdscr.addnstr(y, 2, f"Package: {self.name}", ctx.w - 4,
+                               curses.color_pair(C_RED) | curses.A_BOLD)
+            y += 1
+            if sim.cascade_removable:
+                ctx.stdscr.addnstr(y, 2,
+                                   f"Will also remove {len(sim.cascade_removable)} packages:",
+                                   ctx.w - 4, curses.color_pair(C_YELLOW))
+                y += 1
+                for n in sim.cascade_removable[:8]:
+                    if y >= ctx.h - 4:
+                        break
+                    ctx.stdscr.addnstr(y, 4, n, ctx.w - 6,
+                                       curses.color_pair(C_WHITE))
+                    y += 1
+            if sim.retained_shared:
+                ctx.stdscr.addnstr(y, 2,
+                                   f"{len(sim.retained_shared)} shared deps retained",
+                                   ctx.w - 4, curses.color_pair(C_GREEN))
+                y += 1
+            ctx.stdscr.addnstr(y, 2,
+                               f"Recovery: {format_size(sim.total_recovery_bytes)}",
+                               ctx.w - 4, curses.color_pair(C_GREEN))
+            y += 2
+
+        if self.done:
+            style = curses.color_pair(C_GREEN) if "ok" in self.result.lower() else curses.color_pair(C_RED)
+            ctx.stdscr.addnstr(y, 2, self.result, ctx.w - 4, style)
         else:
-            self.items = state.graph.recursive_rdeps(self.name)
+            ctx.stdscr.addnstr(y, 2, f"Type 'yes' to confirm: {self.buf}_",
+                               ctx.w - 4, curses.color_pair(C_YELLOW) | curses.A_BOLD)
 
-    def render(self, ctx):
-        self._load(ctx)
-        state = ctx.ensure_state()
-        mode_label = "DEPENDENCIES" if self.mode == "deps" else "REQUIRED BY"
+        self._draw_footer(ctx)
 
-        if not self.items:
-            body = Panel(Text(f"  (none)", style="dim"), box=box.ROUNDED)
-            return _page(ctx, f"{mode_label}: {self.name}", body, "q=back")
-
-        t = Table(box=box.SIMPLE_HEAVY, show_header=False, expand=True, padding=(0, 1))
-        t.add_column("", width=3)
-        t.add_column("name", ratio=1)
-        t.add_column("type", ratio=1)
-
-        sel = max(0, min(self.sel, len(self.items) - 1))
-        for i, name in enumerate(self.items):
-            prefix = " > " if i == sel else "   "
-            if name in (state.graph.packages if state else {}):
-                cls, cnt = state.classification(name)
-                label = f"SHARED x{cnt}" if cls == "SHARED" else cls
-                cls_style = ("bold cyan" if cls == "EXPLICIT" else
-                             "magenta" if cls == "SHARED" else
-                             "red" if cls == "ORPHAN" else "dim")
+    def key(self, ctx, k):
+        if self.done:
+            return "pop"
+        if k == 27:  # ESC
+            return "pop"
+        if k in (curses.KEY_ENTER, 10, 13):
+            if self.buf == "yes":
+                backend = detect_backend()
+                import subprocess
+                if backend and "pacman" in backend.name:
+                    proc = subprocess.run(["pacman", "-R", "--noconfirm", self.name],
+                                          capture_output=True)
+                elif backend and "uv" in backend.name:
+                    proc = subprocess.run(["uv", "pip", "uninstall", self.name],
+                                          capture_output=True)
+                else:
+                    proc = subprocess.run(["apt", "remove", "-y", self.name],
+                                          capture_output=True)
+                if proc.returncode == 0:
+                    self.result = f"ok: {self.name} removed"
+                    ctx.state = None
+                else:
+                    self.result = f"error: removal failed"
+                self.done = True
             else:
-                label = "?"
-                cls_style = "dim"
-            t.add_row(
-                Text(prefix, style=SELECTED_STYLE if i == sel else ""),
-                Text(name, style="bold" if i == sel else ""),
-                Text(label, style=cls_style)
-            )
-
-        scroll = Text(f"  {sel + 1}/{len(self.items)}", style="dim")
-        body = Table(t, scroll, box=box.ROUNDED, expand=True)
-        return _page(ctx, f"{mode_label}: {self.name}", body,
-                     "arrows=move  Enter=info  q=back")
-
-    def handle(self, key, ctx):
-        if key in ("q", KEY_ESCAPE):
-            return ("pop",)
-        if key == KEY_UP or key == "k":
-            self.sel = max(0, self.sel - 1)
-            return ("stay",)
-        if key == KEY_DOWN or key == "j":
-            self.sel = min(len(self.items) - 1, self.sel + 1)
-            return ("stay",)
-        if key == KEY_ENTER and self.items:
-            name = self.items[self.sel]
-            return ("push", PackageDetailScreen(name))
-        if key == KEY_HOME or key == "g":
-            self.sel = 0
-            return ("stay",)
-        if key == KEY_END or key == "G":
-            self.sel = max(0, len(self.items) - 1)
-            return ("stay",)
-        return ("stay",)
+                self.buf = ""
+            return None
+        if k in (curses.KEY_BACKSPACE, 127, 8):
+            self.buf = self.buf[:-1]
+            return None
+        if 32 <= k < 127:
+            self.buf += chr(k)
+            return None
+        return None
 
 
-class StorageScreen(Screen):
+class Storage(Screen):
     title = "Storage"
-    hint = "arrows=move  Enter=drill-down  u=up  r=refresh  q=back"
+    hint = "j/k:move  Enter:drill  d:delete  u:up  q:back"
 
     def __init__(self, path=None, depth=2):
+        super().__init__()
         self.path = path or os.path.expanduser("~")
         self.depth = depth
-        self.sel = 0
-        self.items = []  # (name, size, category)
-        self.scanning = False
+        self.items = []
+        self.confirming = False
+        self.confirm_idx = -1
 
     def _load(self, ctx):
-        self.items = []
         sizes = scan_dir_size(self.path, max_depth=self.depth)
+        self.items = []
         for p, s in sizes.items():
             if p == self.path:
                 continue
             cat = classify_path(p)
             short = p.replace(os.path.expanduser("~"), "~")
-            self.items.append((p, short, s, cat))
+            is_dir = os.path.isdir(p)
+            self.items.append((p, short, s, cat, is_dir))
         self.items.sort(key=lambda x: -x[2])
 
-    def render(self, ctx):
+    def draw(self, ctx):
         self._load(ctx)
+        self.title = f"Storage: {self.path.replace(os.path.expanduser('~'), '~')}"
+        self._draw_header(ctx)
         total = sum(i[2] for i in self.items)
-        status = f"{format_size(total, 2)} under {self.path.replace(os.path.expanduser('~'), '~')}"
+        ctx.stdscr.addnstr(1, 0, f" {format_size(total, 2)} total".ljust(ctx.w),
+                           ctx.w - 1, curses.color_pair(C_WHITE))
 
-        if not self.items:
-            body = Panel(Text("  (empty)", style="dim"), box=box.ROUNDED)
-            return _page(ctx, self.title, body, self.hint, status)
+        def render(item, sel):
+            full, short, size, cat, is_dir = item
+            cat_s = {"caches": C_YELLOW, "proot-distro": C_RED,
+                     "$PREFIX": C_GREEN}.get(cat, C_WHITE)
+            icon = "/" if is_dir else " "
+            text = f"{format_size(size):>10}  {icon}{short}"
+            return text, curses.color_pair(cat_s)
 
-        t = Table(box=box.SIMPLE_HEAVY, show_header=True, expand=True, padding=(0, 1))
-        t.add_column("", width=3)
-        t.add_column("SIZE", justify="right", ratio=1)
-        t.add_column("PATH", ratio=3)
-        t.add_column("TYPE", ratio=1)
+        self._draw_list(ctx, self.items, 2, ctx.h - 4, render)
 
-        sel = max(0, min(self.sel, len(self.items) - 1))
-        for i, (full, short, size, cat) in enumerate(self.items):
-            prefix = " > " if i == sel else "   "
-            cat_style = ("cyan" if cat == "caches" else
-                         "yellow" if cat == "proot-distro" else
-                         "green" if cat == "$PREFIX" else "dim")
-            t.add_row(
-                Text(prefix, style=SELECTED_STYLE if i == sel else ""),
-                Text(format_size(size), style="bold" if i == sel else ""),
-                Text(short, style="bold" if i == sel else ""),
-                Text(cat, style=cat_style)
-            )
+        # draw category column
+        for i in range(min(len(self.items), ctx.h - 4)):
+            idx = self.scroll + i
+            if idx < len(self.items):
+                cat = self.items[idx][3]
+                cat_s = {"caches": C_YELLOW, "proot-distro": C_RED,
+                         "$PREFIX": C_GREEN}.get(cat, C_WHITE)
+                y = 2 + i
+                ctx.stdscr.addnstr(y, ctx.w - 16, f"[{cat}]", 15,
+                                   curses.color_pair(cat_s))
 
-        scroll = Text(f"  {sel + 1}/{len(self.items)}", style="dim")
-        body = Table(t, scroll, box=box.ROUNDED, expand=True)
-        return _page(ctx, self.title, body, self.hint, status)
+        if self.confirming and self.confirm_idx < len(self.items):
+            item = self.items[self.confirm_idx]
+            y = ctx.h - 4
+            ctx.stdscr.addnstr(y, 2,
+                               f"DELETE: {item[1]} ({format_size(item[2])})? Type 'yes'",
+                               ctx.w - 4, curses.color_pair(C_RED) | curses.A_BOLD)
 
-    def handle(self, key, ctx):
-        if key in ("q", KEY_ESCAPE):
-            return ("pop",)
-        if key == KEY_UP or key == "k":
-            self.sel = max(0, self.sel - 1)
-            return ("stay",)
-        if key == KEY_DOWN or key == "j":
-            self.sel = min(len(self.items) - 1, self.sel + 1)
-            return ("stay",)
-        if key == KEY_ENTER and self.items:
+        self._draw_footer(ctx)
+
+    def key(self, ctx, k):
+        if self.confirming:
+            if k in (curses.KEY_ENTER, 10, 13) or k == ord('y'):
+                item = self.items[self.confirm_idx]
+                self._do_delete(ctx, item)
+                self.confirming = False
+                ctx.status = f"deleted: {item[1]}"
+                return None
+            self.confirming = False
+            return None
+
+        if k == ord('q'):
+            return "pop"
+        if self._is_up(k):
+            self.sel -= 1
+            return None
+        if self._is_down(k):
+            self.sel += 1
+            return None
+        if self._is_enter(k) and self.items:
             path = self.items[self.sel][0]
             if os.path.isdir(path):
-                return ("push", StorageScreen(path, self.depth))
-            return ("stay",)
-        if key == "u":
+                return f"push:storage:{path}"
+            return None
+        if k == ord('d') and self.items:
+            self.confirm_idx = self.sel
+            self.confirming = True
+            return None
+        if k == ord('u'):
             parent = os.path.dirname(self.path)
             if parent and parent != self.path:
-                return ("replace", StorageScreen(parent, self.depth))
-            return ("stay",)
-        if key == "r":
-            return ("stay",)
-        if key == KEY_HOME or key == "g":
-            self.sel = 0
-            return ("stay",)
-        if key == KEY_END or key == "G":
-            self.sel = max(0, len(self.items) - 1)
-            return ("stay",)
-        return ("stay",)
+                return f"replace:storage:{parent}"
+            return None
+        return None
+
+    def _do_delete(self, ctx, item):
+        import shutil
+        path = item[0]
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+        except OSError as e:
+            ctx.status = f"error: {e}"
 
 
 class CacheScreen(Screen):
     title = "Cache & Cleanup"
-    hint = "arrows=move  space=select  c=clean selected  a=select all  q=back"
+    hint = "j/k:move  Space:select  c:clean  a:all  q:back"
 
     def __init__(self):
-        self.sel = 0
+        super().__init__()
         self.items = []
         self.selected = set()
         self.confirming = False
@@ -857,12 +844,8 @@ class CacheScreen(Screen):
         self.items = []
         for c in ctx.caches:
             if c["size"] > 1024:
-                self.items.append({
-                    "label": c["label"],
-                    "path": c["path"],
-                    "size": c["size"],
-                    "type": "cache",
-                })
+                self.items.append({"label": c["label"], "path": c["path"],
+                                   "size": c["size"], "type": "cache"})
         state = ctx.state
         if state:
             orphans = [(n, state.graph.packages[n].get("installed_size") or 0)
@@ -870,116 +853,91 @@ class CacheScreen(Screen):
                        if state.classification(n)[0] == "ORPHAN"]
             if orphans:
                 total = sum(s for _, s in orphans)
-                self.items.append({
-                    "label": f"{len(orphans)} orphan packages",
-                    "path": None,
-                    "size": total,
-                    "type": "orphans",
-                })
+                self.items.append({"label": f"{len(orphans)} orphan packages",
+                                   "path": None, "size": total, "type": "orphans"})
 
-    def render(self, ctx):
+    def draw(self, ctx):
         self._load(ctx)
+        self._draw_header(ctx)
         total = sum(i["size"] for i in self.items)
-        selected_bytes = sum(self.items[i]["size"] for i in self.selected
-                            if i < len(self.items))
-        status = f"{len(self.items)} items, {format_size(total)} total"
+        sel_bytes = sum(self.items[i]["size"] for i in self.selected
+                        if i < len(self.items))
+        ctx.stdscr.addnstr(1, 0,
+                           f" {len(self.items)} items, {format_size(total)} total".ljust(ctx.w),
+                           ctx.w - 1, curses.color_pair(C_WHITE))
 
-        if not self.items:
-            body = Panel(Text("  nothing to clean", style="dim"), box=box.ROUNDED)
-            return _page(ctx, self.title, body, self.hint, status)
+        def render(item, sel):
+            check = "[x]" if item.get("_sel") else "[ ]"
+            text = f"{check} {item['label']:<30} {format_size(item['size']):>10}"
+            attr = curses.color_pair(C_SELECTED if item.get("_sel") else C_WHITE)
+            return text, attr
 
-        t = Table(box=box.SIMPLE_HEAVY, show_header=True, expand=True, padding=(0, 1))
-        t.add_column("", width=3)
-        t.add_column("[x]", width=4)
-        t.add_column("ITEM", ratio=3)
-        t.add_column("SIZE", justify="right", ratio=1)
-
-        sel = max(0, min(self.sel, len(self.items)))
+        # mark selected
         for i, item in enumerate(self.items):
-            prefix = " > " if i == sel else "   "
-            check = " [x]" if i in self.selected else " [ ]"
-            check_style = SAFE_STYLE if i in self.selected else "dim"
-            t.add_row(
-                Text(prefix, style=SELECTED_STYLE if i == sel else ""),
-                Text(check, style=check_style),
-                Text(item["label"], style="bold" if i == sel else ""),
-                Text(format_size(item["size"]))
-            )
+            item["_sel"] = i in self.selected
 
-        # total line
-        t.add_row("", "",
-                  Text("Selected:", style="bold"),
-                  Text(format_size(selected_bytes), style=SAFE_STYLE))
-
-        body = Table(t, box=box.ROUNDED, expand=True)
+        self._draw_list(ctx, self.items, 2, ctx.h - 4, render)
 
         if self.confirming:
             item = self.items[self.confirm_idx]
-            warn = Panel(
-                Text.assemble(
-                    Text("  WARNING: This will permanently delete files!\n\n", style=DANGER_STYLE),
-                    Text(f"  {item['label']}\n", style="bold"),
-                    Text(f"  {format_size(item['size'])}\n", style=WARN_STYLE),
-                    Text(f"  Path: {item['path'] or '(packages)'}\n\n", style="dim"),
-                    Text("  Type 'yes' to confirm, anything else to cancel:", style=WARN_STYLE)
-                ),
-                title="CONFIRM DELETION",
-                border_style="red", box=box.DOUBLE)
-            body = Table(warn, body, box=None, expand=True)
+            y = ctx.h - 4
+            ctx.stdscr.addnstr(y, 2,
+                               f"WARNING: Delete {item['label']} ({format_size(item['size'])})? Type 'yes'",
+                               ctx.w - 4, curses.color_pair(C_RED) | curses.A_BOLD)
 
-        hint = self.hint
         if self.selected:
-            hint += f"  ({len(self.selected)} selected, {format_size(selected_bytes)})"
-        return _page(ctx, self.title, body, hint, status)
+            ctx.stdscr.addnstr(ctx.h - 2, 0,
+                               f" {len(self.selected)} selected, {format_size(sel_bytes)}".ljust(ctx.w),
+                               ctx.w - 1, curses.color_pair(C_GREEN))
 
-    def handle(self, key, ctx):
+        self._draw_footer(ctx)
+
+    def key(self, ctx, k):
         if self.confirming:
-            if key == KEY_ENTER:
+            if k in (curses.KEY_ENTER, 10, 13) or k == ord('y'):
                 item = self.items[self.confirm_idx]
                 self._do_clean(ctx, item)
                 self.confirming = False
-                return ("status", f"cleaned: {item['label']}")
-            if key == "y":
-                return ("stay",)
+                ctx.status = f"cleaned: {item['label']}"
+                return None
             self.confirming = False
-            return ("stay",)
+            return None
 
-        if key in ("q", KEY_ESCAPE):
-            return ("pop",)
-        if key == KEY_UP or key == "k":
-            self.sel = max(0, self.sel - 1)
-            return ("stay",)
-        if key == KEY_DOWN or key == "j":
-            self.sel = min(len(self.items), self.sel + 1)
-            return ("stay",)
-        if key == " ":
+        if k == ord('q'):
+            return "pop"
+        if self._is_up(k):
+            self.sel -= 1
+            return None
+        if self._is_down(k):
+            self.sel += 1
+            return None
+        if k == ord(' '):
             if self.sel < len(self.items):
                 if self.sel in self.selected:
                     self.selected.discard(self.sel)
                 else:
                     self.selected.add(self.sel)
-            return ("stay",)
-        if key == "a":
+            return None
+        if k == ord('a'):
             if len(self.selected) == len(self.items):
                 self.selected.clear()
             else:
                 self.selected = set(range(len(self.items)))
-            return ("stay",)
-        if key == "c" and self.selected:
-            # confirm first selected item
+            return None
+        if k == ord('c') and self.selected:
             self.confirm_idx = min(self.selected)
             self.confirming = True
-            return ("stay",)
-        if key == KEY_ENTER and self.sel < len(self.items):
+            return None
+        if self._is_enter(k) and self.sel < len(self.items):
             self.confirm_idx = self.sel
             self.confirming = True
-            return ("stay",)
-        return ("stay",)
+            return None
+        return None
 
     def _do_clean(self, ctx, item):
         from .cleanup import (clean_apt_cache, clean_pip_cache, clean_npm_cache,
                               clean_cargo_cache, clean_gradle_cache,
-                              clean_pacman_cache, clean_orphans)
+                              clean_pacman_cache, clean_uv_cache, clean_orphans)
         if item["type"] == "orphans":
             clean_orphans(ctx.db, dry_run=False)
         elif "APT" in item["label"]:
@@ -994,18 +952,22 @@ class CacheScreen(Screen):
             clean_cargo_cache(dry_run=False)
         elif "gradle" in item["label"]:
             clean_gradle_cache(dry_run=False)
+        elif "uv" in item["label"]:
+            clean_uv_cache(dry_run=False)
         self.selected.discard(self.confirm_idx)
         ctx.caches = []
 
 
-class OrphanScreen(Screen):
+class Orphans(Screen):
     title = "Orphan Packages"
-    hint = "arrows=move  Enter=info  space=select  c=cleanup selected  q=back"
+    hint = "j/k:move  Enter:info  Space:select  d:delete  c:cleanup  q:back"
 
     def __init__(self):
-        self.sel = 0
+        super().__init__()
         self.items = []
         self.selected = set()
+        self.confirming = False
+        self.confirm_idx = -1
 
     def _load(self, ctx):
         state = ctx.ensure_state()
@@ -1014,86 +976,111 @@ class OrphanScreen(Screen):
         self.items = []
         for name, row in state.graph.packages.items():
             if state.classification(name)[0] == "ORPHAN":
-                self.items.append((name, row.get("installed_size") or 0))
-        self.items.sort(key=lambda x: -x[1])
+                self.items.append({"name": name, "size": row.get("installed_size") or 0})
+        self.items.sort(key=lambda x: -x["size"])
 
-    def render(self, ctx):
+    def draw(self, ctx):
         self._load(ctx)
-        total = sum(s for _, s in self.items)
-        status = f"{len(self.items)} orphans, {format_size(total)}"
+        self._draw_header(ctx)
+        total = sum(i["size"] for i in self.items)
+        ctx.stdscr.addnstr(1, 0,
+                           f" {len(self.items)} orphans, {format_size(total)}".ljust(ctx.w),
+                           ctx.w - 1, curses.color_pair(C_WHITE))
 
-        if not self.items:
-            body = Panel(Text("  no orphan packages found", style=SAFE_STYLE), box=box.ROUNDED)
-            return _page(ctx, self.title, body, "q=back", status)
+        def render(item, sel):
+            check = "[x]" if item.get("_sel") else "[ ]"
+            text = f"{check} {item['name']:<30} {format_size(item['size']):>10}"
+            attr = curses.color_pair(C_SELECTED if sel else C_WHITE)
+            return text, attr
 
-        t = Table(box=box.SIMPLE_HEAVY, show_header=True, expand=True, padding=(0, 1))
-        t.add_column("", width=3)
-        t.add_column("[x]", width=4)
-        t.add_column("NAME", ratio=2)
-        t.add_column("SIZE", justify="right", ratio=1)
+        # mark selected state on items for render
+        for i, item in enumerate(self.items):
+            item["_sel"] = i in self.selected
 
-        sel = max(0, min(self.sel, len(self.items)))
-        for i, (name, size) in enumerate(self.items):
-            prefix = " > " if i == sel else "   "
-            check = " [x]" if i in self.selected else " [ ]"
-            t.add_row(
-                Text(prefix, style=SELECTED_STYLE if i == sel else ""),
-                Text(check, style=SAFE_STYLE if i in self.selected else "dim"),
-                Text(name, style="bold" if i == sel else ""),
-                Text(format_size(size))
-            )
+        self._draw_list(ctx, self.items, 2, ctx.h - 4, render)
 
-        body = Table(t, box=box.ROUNDED, expand=True)
-        hint = self.hint
-        if self.selected:
-            sel_total = sum(self.items[i][1] for i in self.selected)
-            hint += f"  ({len(self.selected)} selected, {format_size(sel_total)})"
-        return _page(ctx, self.title, body, hint, status)
+        if self.confirming and self.confirm_idx < len(self.items):
+            item = self.items[self.confirm_idx]
+            y = ctx.h - 4
+            ctx.stdscr.addnstr(y, 2,
+                               f"DELETE: {item['name']} ({format_size(item['size'])})? Type 'yes'",
+                               ctx.w - 4, curses.color_pair(C_RED) | curses.A_BOLD)
 
-    def handle(self, key, ctx):
-        if key in ("q", KEY_ESCAPE):
-            return ("pop",)
-        if key == KEY_UP or key == "k":
-            self.sel = max(0, self.sel - 1)
-            return ("stay",)
-        if key == KEY_DOWN or key == "j":
-            self.sel = min(len(self.items) - 1, self.sel + 1)
-            return ("stay",)
-        if key == " ":
-            if self.sel < len(self.items):
-                if self.sel in self.selected:
-                    self.selected.discard(self.sel)
-                else:
-                    self.selected.add(self.sel)
-            return ("stay",)
-        if key == "a":
+        self._draw_footer(ctx)
+
+    def key(self, ctx, k):
+        if self.confirming:
+            if k in (curses.KEY_ENTER, 10, 13) or k == ord('y'):
+                item = self.items[self.confirm_idx]
+                self._do_delete(ctx, item)
+                self.confirming = False
+                ctx.status = f"deleted: {item['name']}"
+                return None
+            self.confirming = False
+            return None
+
+        if k == ord('q'):
+            return "pop"
+        if self._is_up(k):
+            self.sel -= 1
+            return None
+        if self._is_down(k):
+            self.sel += 1
+            return None
+        if k == ord(' ') and self.sel < len(self.items):
+            if self.sel in self.selected:
+                self.selected.discard(self.sel)
+            else:
+                self.selected.add(self.sel)
+            return None
+        if k == ord('a'):
             if len(self.selected) == len(self.items):
                 self.selected.clear()
             else:
                 self.selected = set(range(len(self.items)))
-            return ("stay",)
-        if key == KEY_ENTER and self.items:
-            name = self.items[self.sel][0]
-            return ("push", PackageDetailScreen(name))
-        if key == "c" and self.selected:
+            return None
+        if self._is_enter(k) and self.items:
+            name = self.items[self.sel]["name"]
+            return f"push:detail:{name}"
+        if k == ord('d') and self.items:
+            self.confirm_idx = self.sel
+            self.confirming = True
+            return None
+        if k == ord('c') and self.selected:
             from .cleanup import clean_orphans
             clean_orphans(ctx.db, dry_run=False)
             self.selected.clear()
             ctx.state = None
-            return ("status", "orphans cleaned")
-        return ("stay",)
+            ctx.status = "orphans cleaned"
+            return None
+        return None
+
+    def _do_delete(self, ctx, item):
+        backend = detect_backend()
+        import subprocess
+        if backend and "pacman" in backend.name:
+            subprocess.run(["pacman", "-R", "--noconfirm", item["name"]],
+                           capture_output=True)
+        elif backend and "uv" in backend.name:
+            subprocess.run(["uv", "pip", "uninstall", item["name"]],
+                           capture_output=True)
+        else:
+            subprocess.run(["apt", "remove", "-y", item["name"]],
+                           capture_output=True)
+        self.items.remove(item)
+        ctx.state = None
 
 
-class DepBrowserScreen(Screen):
+class DepBrowser(Screen):
     title = "Dependency Browser"
-    hint = "arrows=move  Enter=drill-down  /=search  q=back"
+    hint = "j/k:move  Enter:info  d:delete  /:search  q:back"
 
     def __init__(self):
-        self.sel = 0
+        super().__init__()
         self.items = []
         self.search = ""
-        self.input_buf = ""
-        self.input_mode = False
+        self._input_buf = ""
+        self._input_mode = False
 
     def _load(self, ctx):
         state = ctx.ensure_state()
@@ -1106,94 +1093,78 @@ class DepBrowserScreen(Screen):
             deps = len(state.graph.direct_deps(name))
             if self.search and self.search.lower() not in name.lower():
                 continue
-            self.items.append((name, row, cls, cnt, rdeps, deps))
-        self.items.sort(key=lambda x: -x[4])  # sort by rdeps desc
+            self.items.append((name, cls, cnt, rdeps, deps))
+        self.items.sort(key=lambda x: -x[3])
 
-    def render(self, ctx):
+    def draw(self, ctx):
         self._load(ctx)
-        status = f"{len(self.items)} packages"
+        self._draw_header(ctx)
+        ctx.stdscr.addnstr(1, 0,
+                           f" {len(self.items)} packages".ljust(ctx.w),
+                           ctx.w - 1, curses.color_pair(C_WHITE))
 
-        t = Table(box=box.SIMPLE_HEAVY, show_header=True, expand=True, padding=(0, 1))
-        t.add_column("", width=3)
-        t.add_column("NAME", ratio=2)
-        t.add_column("TYPE", ratio=1)
-        t.add_column("RDEPS", justify="right", ratio=1)
-        t.add_column("DEPS", justify="right", ratio=1)
+        if self._input_mode:
+            ctx.stdscr.addnstr(2, 0, f" search: {self._input_buf}_".ljust(ctx.w),
+                               ctx.w - 1, curses.color_pair(C_YELLOW))
+            start_y = 3
+        else:
+            start_y = 2
 
-        sel = max(0, min(self.sel, len(self.items)))
-        for i, (name, row, cls, cnt, rdeps, deps) in enumerate(self.items):
-            prefix = " > " if i == sel else "   "
+        def render(item, sel):
+            name, cls, cnt, rdeps, deps = item
             label = f"SHARED x{cnt}" if cls == "SHARED" else cls
-            cls_style = ("bold cyan" if cls == "EXPLICIT" else
-                         "magenta" if cls == "SHARED" else
-                         "red" if cls == "ORPHAN" else "dim")
-            t.add_row(
-                Text(prefix, style=SELECTED_STYLE if i == sel else ""),
-                Text(name, style="bold" if i == sel else ""),
-                Text(label, style=cls_style),
-                Text(str(rdeps), style=WARN_STYLE if rdeps > 5 else ""),
-                Text(str(deps))
-            )
+            text = f"{name:<28} {label:<16} rdeps:{rdeps:<4} deps:{deps}"
+            return text, curses.color_pair(C_WHITE)
 
-        body = Table(t, box=box.ROUNDED, expand=True)
-        if self.input_mode:
-            input_panel = Panel(
-                Text(f"  search: {self.input_buf}_", style="bold"),
-                title="Search", border_style="yellow", box=box.ROUNDED)
-            body = Table(input_panel, body, box=None, expand=True)
+        self._draw_list(ctx, self.items, start_y, ctx.h - 4, render)
+        self._draw_footer(ctx)
 
-        return _page(ctx, self.title, body,
-                     "arrows=move  Enter=info  /=search  q=back", status)
-
-    def handle(self, key, ctx):
-        if self.input_mode:
-            if key == KEY_ENTER:
-                self.search = self.input_buf
-                self.input_mode = False
+    def key(self, ctx, k):
+        if self._input_mode:
+            if k == 27:
+                self._input_mode = False
+                return None
+            if k in (curses.KEY_ENTER, 10, 13):
+                self.search = self._input_buf
+                self._input_mode = False
                 self.sel = 0
-                return ("stay",)
-            if key == KEY_ESCAPE or key == "ctrl-c":
-                self.input_mode = False
-                return ("stay",)
-            if key == KEY_BACKSPACE:
-                self.input_buf = self.input_buf[:-1]
-                return ("stay",)
-            if key and len(key) == 1 and key.isprintable():
-                self.input_buf += key
-                return ("stay",)
-            return ("stay",)
+                return None
+            if k in (curses.KEY_BACKSPACE, 127, 8):
+                self._input_buf = self._input_buf[:-1]
+                return None
+            if 32 <= k < 127:
+                self._input_buf += chr(k)
+                return None
+            return None
 
-        if key in ("q", KEY_ESCAPE):
-            return ("pop",)
-        if key == "/":
-            self.input_mode = True
-            self.input_buf = ""
-            return ("stay",)
-        if key == KEY_UP or key == "k":
-            self.sel = max(0, self.sel - 1)
-            return ("stay",)
-        if key == KEY_DOWN or key == "j":
-            self.sel = min(len(self.items) - 1, self.sel + 1)
-            return ("stay",)
-        if key == KEY_ENTER and self.items:
+        if k == ord('q'):
+            return "pop"
+        if k == ord('/'):
+            self._input_mode = True
+            self._input_buf = ""
+            return None
+        if self._is_up(k):
+            self.sel -= 1
+            return None
+        if self._is_down(k):
+            self.sel += 1
+            return None
+        if self._is_enter(k) and self.items:
             name = self.items[self.sel][0]
-            return ("push", PackageDetailScreen(name))
-        if key == KEY_HOME or key == "g":
-            self.sel = 0
-            return ("stay",)
-        if key == KEY_END or key == "G":
-            self.sel = max(0, len(self.items) - 1)
-            return ("stay",)
-        return ("stay",)
+            return f"push:detail:{name}"
+        if k == ord('d') and self.items:
+            name = self.items[self.sel][0]
+            return f"push:confirm:{name}"
+        return None
 
 
-class SearchScreen(Screen):
+class Search(Screen):
     title = "Search"
-    hint = "type to search  Enter=select  q=back"
+    hint = "type to search  Enter:select  d:delete  q:back"
 
     def __init__(self):
+        super().__init__()
         self.query = ""
-        self.sel = 0
         self.items = []
 
     def _load(self, ctx):
@@ -1210,237 +1181,182 @@ class SearchScreen(Screen):
                 self.items.append((name, row, cls, cnt))
         self.items.sort(key=lambda x: -(x[1].get("installed_size") or 0))
 
-    def render(self, ctx):
+    def draw(self, ctx):
         self._load(ctx)
-        status = f"{len(self.items)} matches"
+        self._draw_header(ctx)
+        ctx.stdscr.addnstr(1, 0,
+                           f" search: {self.query}_".ljust(ctx.w),
+                           ctx.w - 1, curses.color_pair(C_YELLOW) | curses.A_BOLD)
 
-        input_panel = Panel(
-            Text(f"  search: {self.query}_", style="bold"),
-            title="Query", border_style="yellow", box=box.ROUNDED)
-
-        if not self.items:
-            body = Table(input_panel,
-                         Panel(Text("  type to search", style="dim"), box=box.ROUNDED),
-                         box=None, expand=True)
-            return _page(ctx, self.title, body, self.hint, status)
-
-        t = Table(box=box.SIMPLE_HEAVY, show_header=True, expand=True, padding=(0, 1))
-        t.add_column("", width=3)
-        t.add_column("NAME", ratio=2)
-        t.add_column("SIZE", justify="right", ratio=1)
-        t.add_column("TYPE", ratio=1)
-
-        sel = max(0, min(self.sel, len(self.items)))
-        for i, (name, row, cls, cnt) in enumerate(self.items):
-            prefix = " > " if i == sel else "   "
+        def render(item, sel):
+            name, row, cls, cnt = item
+            size = format_size(row.get("installed_size") or 0)
             label = f"SHARED x{cnt}" if cls == "SHARED" else cls
-            t.add_row(
-                Text(prefix, style=SELECTED_STYLE if i == sel else ""),
-                Text(name, style="bold" if i == sel else ""),
-                Text(format_size(row.get("installed_size") or 0)),
-                Text(label)
-            )
+            text = f"{name:<28} {size:>10}  {label}"
+            return text, curses.color_pair(C_WHITE)
 
-        body = Table(input_panel, t, box=None, expand=True)
-        return _page(ctx, self.title, body, self.hint, status)
+        self._draw_list(ctx, self.items, 2, ctx.h - 4, render)
+        self._draw_footer(ctx)
 
-    def handle(self, key, ctx):
-        if key == KEY_ENTER and self.items:
-            name = self.items[self.sel][0]
-            return ("push", PackageDetailScreen(name))
-        if key == KEY_UP or key == "k":
-            self.sel = max(0, self.sel - 1)
-            return ("stay",)
-        if key == KEY_DOWN or key == "j":
-            self.sel = min(len(self.items) - 1, self.sel + 1)
-            return ("stay",)
-        if key == KEY_BACKSPACE:
-            self.query = self.query[:-1]
-            self.sel = 0
-            return ("stay",)
-        if key == KEY_ESCAPE:
+    def key(self, ctx, k):
+        if k == 27:  # ESC
             if self.query:
                 self.query = ""
                 self.sel = 0
-                return ("stay",)
-            return ("pop",)
-        if key and len(key) == 1 and key.isprintable():
-            self.query += key
+                return None
+            return "pop"
+        if k in (curses.KEY_ENTER, 10, 13) and self.items:
+            name = self.items[self.sel][0]
+            return f"push:detail:{name}"
+        if k == ord('d') and self.items:
+            name = self.items[self.sel][0]
+            return f"push:confirm:{name}"
+        if self._is_up(k):
+            self.sel -= 1
+            return None
+        if self._is_down(k):
+            self.sel += 1
+            return None
+        if k in (curses.KEY_BACKSPACE, 127, 8):
+            self.query = self.query[:-1]
             self.sel = 0
-            return ("stay",)
-        return ("stay",)
-
-
-class RemoveConfirmScreen(Screen):
-    title = "Confirm Removal"
-    hint = "Type 'yes' to confirm, anything else to cancel"
-
-    def __init__(self, name, sim_result):
-        self.name = name
-        self.sim = sim_result
-        self.input_buf = ""
-        self.done = False
-        self.result_msg = ""
-
-    def render(self, ctx):
-        sim = self.sim
-        lines = [
-            Text("  You are about to remove:", style=WARN_STYLE),
-            Text(f"    {self.name}", style="bold"),
-            Text(""),
-        ]
-        if sim.cascade_removable:
-            lines.append(Text(f"  This will also remove {len(sim.cascade_removable)} packages:",
-                              style=DANGER_STYLE))
-            for n in sim.cascade_removable[:8]:
-                lines.append(Text(f"    {n}", style="dim"))
-            if len(sim.cascade_removable) > 8:
-                lines.append(Text(f"    ... and {len(sim.cascade_removable) - 8} more",
-                                  style="dim"))
-        if sim.retained_shared:
-            lines.append(Text(f"  {len(sim.retained_shared)} shared dependencies will be retained",
-                              style=SAFE_STYLE))
-        if sim.broken:
-            lines.append(Text(f"  WARNING: {len(sim.broken)} packages would break!",
-                              style=DANGER_STYLE))
-        lines.append(Text(""))
-        lines.append(Text(f"  Recovery: {format_size(sim.total_recovery_bytes)}", style=WARN_STYLE))
-        lines.append(Text(""))
-        if self.done:
-            lines.append(Text(f"  {self.result_msg}", style=SAFE_STYLE if "ok" in self.result_msg.lower() else DANGER_STYLE))
-        else:
-            lines.append(Text(f"  Type 'yes' to confirm: {self.input_buf}_", style="bold"))
-
-        body = Panel(
-            Text("\n".join(str(s) for s in lines), overflow="fold"),
-            title="CONFIRM PACKAGE REMOVAL",
-            border_style="red", box=box.DOUBLE)
-        return _page(ctx, self.title, body, self.hint)
-
-    def handle(self, key, ctx):
-        if self.done:
-            if key in ("q", KEY_ESCAPE, KEY_ENTER):
-                return ("pop",)
-            return ("stay",)
-        if key == KEY_ESCAPE or key == "ctrl-c":
-            return ("pop",)
-        if key == KEY_BACKSPACE:
-            self.input_buf = self.input_buf[:-1]
-            return ("stay",)
-        if key == KEY_ENTER:
-            if self.input_buf == "yes":
-                from .package.backend import detect_backend
-                backend = detect_backend()
-                import subprocess
-                if backend and "pacman" in backend.name:
-                    proc = subprocess.run(["pacman", "-R", "--noconfirm", self.name])
-                else:
-                    proc = subprocess.run(["apt", "remove", "-y", self.name])
-                if proc.returncode == 0:
-                    self.result_msg = f"ok: {self.name} removed"
-                    ctx.state = None
-                else:
-                    self.result_msg = f"error: removal failed (exit {proc.returncode})"
-                self.done = True
-                return ("stay",)
-            self.input_buf = ""
-            return ("stay",)
-        if key and len(key) == 1 and key.isprintable():
-            self.input_buf += key
-            return ("stay",)
-        return ("stay",)
+            return None
+        if 32 <= k < 127:
+            self.query += chr(k)
+            self.sel = 0
+            return None
+        return None
 
 
 # ── app ──────────────────────────────────────────────────────────────────
 
-class _App:
-    def __init__(self, ctx: Context):
-        self.ctx = ctx
-        self.stack: List[Screen] = [DashboardScreen()]
-        self.last_size = None
+def _make_screen(spec):
+    """Create a screen from a 'type:args' spec string."""
+    parts = spec.split(":", 2)
+    kind = parts[1] if len(parts) > 1 else ""
+    arg = parts[2] if len(parts) > 2 else ""
+    if kind == "pkglist":
+        return PkgList()
+    if kind == "detail":
+        return Detail(arg)
+    if kind == "confirm":
+        return ConfirmRemoval(arg)
+    if kind == "storage":
+        return Storage(arg if arg else None)
+    if kind == "cache":
+        return CacheScreen()
+    if kind == "orphans":
+        return Orphans()
+    if kind == "depbrowser":
+        return DepBrowser()
+    if kind == "search":
+        return Search()
+    return Dashboard()
 
-    @property
-    def screen(self):
-        return self.stack[-1]
+
+class App:
+    def __init__(self, stdscr):
+        self.ctx = Ctx(stdscr=stdscr)
+        self.ctx.refresh_size()
+        self.stack: List[Screen] = [Dashboard()]
 
     def run(self):
-        console = self.ctx.console
-        fd = sys.stdin.fileno()
-        old = _raw_mode(fd)
-        try:
-            with Live(self.screen.render(self.ctx), console=console,
-                      screen=True, refresh_per_second=8,
-                      transient=False, auto_refresh=False) as live:
-                while True:
-                    size = (console.width, console.height)
-                    dirty = self.last_size != size
-                    self.last_size = size
-                    key = _read_key(fd)
-                    if key:
-                        dirty = True
-                    action = self._dispatch(key)
-                    if action[0] == "quit":
-                        self.ctx.status = ""
-                        return
-                    if action[0] == "status":
-                        self.ctx.status = action[1]
-                        dirty = True
-                    if key and action[0] != "status":
-                        self.ctx.status = ""
-                    if dirty:
-                        try:
-                            live.update(self.screen.render(self.ctx))
-                        except Exception:
-                            pass
-                    else:
-                        if key is None:
-                            time.sleep(0.01)
-                        else:
-                            try:
-                                live.update(self.screen.render(self.ctx))
-                            except Exception:
-                                pass
-        except KeyboardInterrupt:
-            self.ctx.status = ""
+        stdscr = self.ctx.stdscr
+        curses.curs_set(0)
+        stdscr.timeout(50)
+        _init_colors()
+
+        # enable mouse
+        curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+        curses.mouseinterval(0)
+
+        while True:
+            stdscr.erase()
+            self.ctx.refresh_size()
+
+            screen = self.stack[-1]
+            screen.draw(self.ctx)
+
+            # status bar
+            if self.ctx.status:
+                stdscr.addnstr(self.ctx.h - 2, 0,
+                               f" {self.ctx.status}".ljust(self.ctx.w),
+                               self.ctx.w - 1, curses.color_pair(C_YELLOW))
+
+            stdscr.refresh()
+
+            k = stdscr.getch()
+            if k == -1:
+                continue
+
+            # terminal resize — redraw on next loop iteration
+            if k == curses.KEY_RESIZE:
+                stdscr.clear()
+                continue
+
+            # mouse events - treat as click
+            if k == curses.KEY_MOUSE:
+                try:
+                    _, mx, my, _, bstate = curses.getmouse()
+                    if bstate & curses.BUTTON1_CLICKED:
+                        # find item at my position
+                        if my == 0:
+                            continue  # header
+                        if my == self.ctx.h - 1:
+                            continue  # footer
+                        # map to list index
+                        item_idx = screen.scroll + (my - 2)
+                        if hasattr(screen, 'items') and item_idx < len(screen.items):
+                            screen.sel = item_idx
+                            # simulate enter
+                            result = screen.key(self.ctx, curses.KEY_ENTER)
+                            self._handle_result(result)
+                            continue
+                except Exception:
+                    pass
+                continue
+
+            result = screen.key(self.ctx, k)
+            self._handle_result(result)
+
+    def _handle_result(self, result):
+        if result is None:
             return
-        except Exception as e:
-            try:
-                console.print(f"[red]TUI error: {e}[/]")
-            except Exception:
-                pass
+        if result == "quit":
+            raise KeyboardInterrupt
+        if result == "pop":
+            if len(self.stack) > 1:
+                self.stack.pop()
             return
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-    def _dispatch(self, key):
-        if key == "ctrl-c" or key == "ctrl-d":
-            return ("quit",)
-        if key == "q" and len(self.stack) <= 1:
-            return ("quit",)
-        if key is None:
-            return ("stay",)
-        return self.screen.handle(key, self.ctx)
+        if result.startswith("push:"):
+            self.stack.append(_make_screen(result))
+        if result.startswith("replace:"):
+            if len(self.stack) > 1:
+                self.stack.pop()
+            self.stack.append(_make_screen(result))
 
 
-# ── entry points ─────────────────────────────────────────────────────────
-
-def _smoke_render(console, ctx):
-    """Render dashboard once in non-interactive mode."""
-    screen = DashboardScreen()
-    try:
-        console.print(screen.render(ctx))
-    except Exception:
-        console.print("[red]tpm TUI: non-interactive mode[/]")
+def _smoke(stdscr):
+    """Non-interactive: just show dashboard."""
+    _init_colors()
+    ctx = Ctx(stdscr=stdscr)
+    ctx.ensure_state()
+    ctx.ensure_caches()
+    ctx.refresh_size()
+    screen = Dashboard()
+    screen.draw(ctx)
+    stdscr.refresh()
+    stdscr.getch()
 
 
 def run(no_color=False, db=None, console=None):
-    """Entry point for tpm tui."""
-    console = console or Console()
-    ctx = Context(console=console, no_color=no_color, db=db)
-    ctx.ensure_state()
-    if not console.is_terminal:
-        _smoke_render(console, ctx)
+    """Entry point."""
+    def _main(stdscr):
+        app = App(stdscr)
+        try:
+            app.run()
+        except KeyboardInterrupt:
+            pass
         return 0
-    app = _App(ctx)
-    app.run()
-    return 0
+
+    return curses.wrapper(_main)

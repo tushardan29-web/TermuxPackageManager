@@ -14,6 +14,7 @@ CACHE_CANDIDATES = [
     ("$HOME/.npm", "npm cache (legacy)"),
     ("$HOME/.cargo/registry", "cargo registry"),
     ("$HOME/.gradle/caches", "gradle cache"),
+    ("$HOME/.cache/uv", "uv cache"),
     ("$PREFIX/var/cache/apt", "APT cache"),
     ("$PREFIX/var/cache/apt/archives", "APT archive cache"),
     ("$PREFIX/var/cache/pacman/pkg", "pacman package cache"),
