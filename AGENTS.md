@@ -11,7 +11,7 @@ Python 3.10+, rich for TUI, SQLite for index.
 | Module | Purpose |
 |--------|---------|
 | `src/tpm/cli.py` | 18 CLI commands, argparse, JSON output |
-| `src/tpm/tui.py` | Rich-based interactive TUI, 8 screen types |
+| `src/tpm/tui.py` | Rich-based interactive TUI, 10 screen types |
 | `src/tpm/core.py` | SystemState loading, freshness checks |
 | `src/tpm/scanner.py` | Scan orchestration, staleness detection |
 | `src/tpm/database.py` | SQLite index, schema, read/write |

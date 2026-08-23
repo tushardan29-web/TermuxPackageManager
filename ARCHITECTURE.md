@@ -31,7 +31,7 @@ modules. No logic is duplicated.
 | Module | Purpose |
 |--------|---------|
 | `cli.py` | Argparse entry point, 18 commands, JSON output |
-| `tui.py` | Interactive TUI (rich-based), 8 screen types |
+| `tui.py` | Interactive TUI (rich-based), 10 screen types, mouse+keyboard |
 | `core.py` | SystemState loading, freshness checks |
 | `scanner.py` | Scan orchestration, staleness detection |
 | `database.py` | SQLite index with schema, indexes, read/write |
@@ -203,3 +203,43 @@ cleanup:
   per-category: clean_apt_cache, clean_pip_cache, etc.
   report cleaned bytes
 ```
+
+## TUI Architecture
+
+The TUI uses a screen-stack pattern with rich's Live display:
+
+```
+_App
+  stack: [DashboardScreen, PackageListScreen, PackageDetailScreen]
+                                    ^current
+  _dispatch(key) -> screen.handle(key, ctx) -> (action, ...)
+```
+
+### Screen types
+
+| Screen | Purpose |
+|--------|---------|
+| DashboardScreen | Stats overview, navigation hub |
+| PackageListScreen | Filterable/sortable package table with search |
+| PackageDetailScreen | Full info, deps, rdeps, files, simulation |
+| TreeScreen | Recursive dep/rdep tree viewer |
+| StorageScreen | Directory browser with sizes, drill-down |
+| CacheScreen | Cache detection, per-item selection and cleanup |
+| OrphanScreen | Orphan list, batch selection and cleanup |
+| DepBrowserScreen | Packages sorted by dependency count |
+| SearchScreen | Live search across packages |
+| RemoveConfirmScreen | Typed confirmation before removal |
+
+### Input handling
+
+- Raw terminal mode (cbreak) for instant key response
+- SGR mouse protocol for click support
+- Vi keys (j/k) + arrow keys + emacs (ctrl-a/e) on all lists
+- Screen stack: push (enter detail), pop (back), replace (navigate)
+
+### Security in TUI
+
+- Cache cleanup: shows WARNING panel with path/size, requires typing "yes"
+- Package removal: shows simulation, requires typing "yes"
+- Orphan cleanup: batch selection, confirmation dialog
+- No destructive action executes without explicit typed confirmation

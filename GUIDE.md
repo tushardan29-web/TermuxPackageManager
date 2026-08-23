@@ -587,63 +587,126 @@ claiming uninstalled dependencies, etc.
 
 ### `tpm tui`
 
-Launches the interactive terminal UI.
+Launches the fully interactive terminal UI with mouse + keyboard support.
+Usage hints appear on every screen.
 
 ```
 +----------------------------------------------------------+
-| Dashboard                                                |
+|   Dashboard                                              |
 +----------------------------------------------------------+
 |                                                          |
-| packages                       333                       |
-| installed size             3.2 GiB                       |
-| caches (detectable)        4.5 GiB                       |
-| explicit                       116                       |
-| essential                       45                       |
-| shared deps                     70                       |
-| single-use                     119                       |
-| orphans             13 (115.2 MiB)                       |
-| potential cleanup          4.6 GiB                       |
-| backend                   apt/dpkg                       |
+|   packages                   333                         |
+|   installed size             3.2 GiB                     |
+|   caches                     4.5 GiB                     |
+|   explicit                   116                         |
+|   essential                  45                          |
+|   shared deps                70                          |
+|   single-use                 119                         |
+|   orphans                    13 (115.2 MiB)              |
+|   cleanup potential          4.6 GiB                     |
+|   backend                    apt/dpkg                    |
 |                                                          |
 +----------------------------------------------------------+
-| p=Packages d=Shared-deps s=Storage o=Orphans c=Cleanup   |
-| /=Search q=Quit                                         |
+|   p=Packages  d=Deps  s=Storage  o=Orphans  c=Cleanup    |
+|   /=Search  q=Quit                                      |
 +----------------------------------------------------------+
 ```
 
-### Navigation keys
+### Screens
+
+| Screen | Key | Description |
+|--------|-----|-------------|
+| Dashboard | (home) | Overview stats, navigation hub |
+| Package List | `p` | All packages with filtering, sorting, search |
+| Dep Browser | `d` | Browse packages by dependency count |
+| Storage | `s` | Directory tree with sizes, drill-down |
+| Orphans | `o` | Orphan packages, batch cleanup |
+| Cleanup | `c` | Cache detection, per-item selection and cleanup |
+| Search | `/` | Live search across packages |
+| Package Detail | Enter | Full info, deps, rdeps, files, simulation |
+| Dep Tree | `d` (from detail) | Recursive dependency tree |
+| RDep Tree | `R` (from detail) | Recursive reverse dependency tree |
+| Remove Confirm | (from detail) | Typed confirmation before removal |
+
+### Keyboard shortcuts (universal)
+
+| Key | Action |
+|-----|--------|
+| Arrow keys / `j`/`k` | Navigate up/down |
+| Enter | Select / drill-down |
+| `q` / Escape | Back / Quit |
+| `g` / Home | Jump to top |
+| `G` / End | Jump to bottom |
+| Page Up/Down | Scroll by page |
+| `ctrl-c` / `ctrl-d` | Quit |
+
+### Dashboard keys
 
 | Key | Action |
 |-----|--------|
 | `p` | Package list |
-| `d` | Shared dependencies list |
-| `s` | Storage breakdown |
-| `o` | Orphans list |
-| `c` | Cleanup review |
+| `d` | Dependency browser |
+| `s` | Storage analyzer |
+| `o` | Orphan packages |
+| `c` | Cache cleanup |
 | `/` | Search |
-| `q` | Back / Quit |
 
 ### Package list keys
 
 | Key | Action |
 |-----|--------|
 | Arrow keys | Navigate |
-| `i` or Enter | Package info |
-| `e` | Filter: explicit only |
-| `s` | Filter: shared only |
-| `o` | Filter: orphans only |
-| `x` | Filter: all |
-| `/` | Search |
-| `q` | Back |
+| Enter | Package detail |
+| `e` | Toggle: explicit only |
+| `s` | Toggle: shared only |
+| `o` | Toggle: orphans only |
+| `x` | Reset: show all |
+| `/` | Type search filter |
+| `r` | Rescan packages |
 
-### Package info keys
+### Package detail keys
 
 | Key | Action |
 |-----|--------|
 | `r` | Toggle removal simulation |
 | `d` | Dependency tree |
 | `R` | Reverse dependency tree |
+| `f` | Toggle file list |
 | `q` | Back |
+
+### Storage keys
+
+| Key | Action |
+|-----|--------|
+| Enter | Drill into directory |
+| `u` | Go up to parent |
+| `r` | Refresh |
+
+### Cache/cleanup keys
+
+| Key | Action |
+|-----|--------|
+| Space | Toggle selection |
+| `a` | Select/deselect all |
+| Enter | Confirm clean selected item |
+| `c` | Clean all selected (with warning) |
+
+### Security
+
+Every destructive action in the TUI requires explicit confirmation:
+
+- **Cache cleanup**: Shows WARNING with file path and size, must type
+  `yes` to proceed
+- **Orphan removal**: Shows which packages will be removed, requires
+  confirmation
+- **Package removal**: Full simulation shown, then typed `yes` required
+- **No accidental deletions**: Escape or any other key cancels
+
+### Mouse support
+
+The TUI supports SGR mouse protocol. Click on list items to select,
+click buttons to activate. Works in terminals that support mouse events
+(kitty, alacritty, wezterm, xterm with mouse tracking).
 
 ---
 
