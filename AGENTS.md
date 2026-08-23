@@ -2,21 +2,29 @@
 
 ## Project
 
-tpm — Termux Package Manager & Storage Analyzer. Works on Termux (Android),
-Debian/Ubuntu, and Arch Linux.
+tpm v0.1.0 -- Termux Package Manager & Storage Analyzer.
+Works on Termux (Android), Debian/Ubuntu, and Arch Linux.
+Python 3.10+, rich for TUI, SQLite for index.
 
 ## Key Modules
 
-- `src/tpm/environment.py` — `detect_environment()`: discovers `$PREFIX`, OS,
-  and active package manager (apt/pacman)
-- `src/tpm/package/backend.py` — `PackageManagerBackend` base class with
-  `AptBackend` (dpkg) and `PacmanBackend` (pacman). `detect_backend()` picks
-  the right one based on `detect_environment()`.
-- `src/tpm/cli.py` — CLI commands (scan, list, search, info, deps, rdeps,
-  orphans, files, storage, largest, cache, clean, remove, doctor, tui)
-- `src/tpm/tui.py` — Interactive TUI (rich-based, same core library as CLI)
-- `src/tpm/scanner.py` — Scans backend into SQLite index
-- `src/tpm/storage/scanner.py` — Filesystem scanner, detects pacman package cache
+| Module | Purpose |
+|--------|---------|
+| `src/tpm/cli.py` | 18 CLI commands, argparse, JSON output |
+| `src/tpm/tui.py` | Rich-based interactive TUI, 8 screen types |
+| `src/tpm/core.py` | SystemState loading, freshness checks |
+| `src/tpm/scanner.py` | Scan orchestration, staleness detection |
+| `src/tpm/database.py` | SQLite index, schema, read/write |
+| `src/tpm/config.py` | TOML-like config reader |
+| `src/tpm/cleanup.py` | Cache cleanup backends |
+| `src/tpm/environment.py` | Termux vs Linux detection |
+| `src/tpm/formatter.py` | Binary size formatting |
+| `src/tpm/validation.py` | Package name validation |
+| `src/tpm/dependency/parser.py` | Debian dependency expressions |
+| `src/tpm/dependency/graph.py` | Adjacency graph, classification |
+| `src/tpm/removal/simulator.py` | Graph reachability simulation |
+| `src/tpm/package/backend.py` | AptBackend + PacmanBackend |
+| `src/tpm/storage/scanner.py` | Filesystem scanner, cache detection |
 
 ## Backend Details
 
@@ -25,12 +33,11 @@ Both backends produce identical record dicts:
   `explicitly_installed`, `essential`, `priority`, `source`, `description`,
   `depends_groups`
 
-Backend-specific details:
-- **AptBackend**: reads `/var/lib/dpkg/status` via `dpkg-query -W -f=...`
-  with STX separation; `apt-mark showmanual` for explicit list
-- **PacmanBackend**: reads `$PREFIX/var/lib/pacman/local/*/desc` files
-  directly (no subprocess for metadata); `pacman -Ql` for file lists;
-  `%REASON%` field determines explicit/dependency status
+**AptBackend**: reads dpkg status via `dpkg-query -W -f=...` with STX
+separator; `apt-mark showmanual` for explicit list.
+
+**PacmanBackend**: reads `$PREFIX/var/lib/pacman/local/*/desc` files
+directly; `pacman -Ql` for file lists; `%REASON%` for explicit/dependency.
 
 ## Testing
 
@@ -38,5 +45,32 @@ Backend-specific details:
 python3 -m unittest discover -s tests
 ```
 
-6 test files: test_parser, test_graph, test_simulator, test_formatter,
-test_validation, test_database.
+8 test files: test_parser, test_graph, test_simulator, test_formatter,
+test_validation, test_database, test_pacman, test_cleanup.
+
+## Safety Rules
+
+- Never run `apt remove` or `pacman -R` in tests/development
+- Never delete package files directly
+- Read-only inspection only during development
+- Subprocess argument arrays, never shell strings
+- Validate package names via `tpm.validation`
+
+## CLI Commands
+
+scan, rescan, list, search, info, deps, rdeps, orphans, files,
+storage, largest, cache, clean, remove, doctor, tui, version, help
+
+## JSON Output
+
+Every command supports `--json`. Stdout is valid JSON only; errors
+go to stderr.
+
+## Installation
+
+```sh
+pip install -e .       # development
+pip install .          # install
+dpkg -i dist/*.deb     # Termux .deb
+bash install.sh        # guided install
+```
