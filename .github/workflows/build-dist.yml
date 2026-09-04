@@ -15,31 +15,48 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Use the system /usr/bin/python3 directly. actions/setup-python installs
+      # into /opt/hostedtoolcache which leaks host paths into the .deb when
+      # build-deb.sh queries site.getsitepackages(). Using system python keeps
+      # site-packages at /usr/lib/python3.*/site-packages -- a clean path that
+      # we never bake into the package.
       - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install build deps
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install build setuptools wheel
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip python3-venv dpkg-dev
+          python3 --version
+          python3 -c "import sys; print(sys.prefix)"
+
+      - name: Install build tools
+        run: |
+          python3 -m venv /tmp/build-venv
+          /tmp/build-venv/bin/pip install --upgrade pip build setuptools wheel
 
       - name: Build wheel and sdist
         run: |
           rm -rf dist
-          python -m build
+          /tmp/build-venv/bin/python -m build
 
-      - name: Build .deb (Debian/Ubuntu)
+      # Build the Termux .deb with PREFIX=/data/data/com.termux/files/usr.
+      # The wrapper inside the .deb uses /usr/bin/env python3, so on a real
+      # Termux install python3 resolves to $PREFIX/bin/python3 which is on PATH.
+      - name: Build Termux .deb
         run: |
-          sudo apt-get update
-          sudo apt-get install -y dpkg-dev
-          bash build-deb.sh
+          rm -rf build
+          mkdir -p dist
+          bash build-deb.sh --prefix=/data/data/com.termux/files/usr --version=0.1.0
+          # Sanity: the deb must not contain /opt
+          if tar tf dist/tpm_*.deb 2>/dev/null | grep -q "^opt/"; then
+            echo "FAIL: .deb contains /opt entries"
+            dpkg-deb -c dist/tpm_*.deb | grep "opt/"
+            exit 1
+          fi
+          echo "OK: no /opt entries in deb"
 
       - name: List dist contents
         run: ls -la dist
 
-      - name: Commit and push dist
+      - name: Commit and push dist artifacts
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
