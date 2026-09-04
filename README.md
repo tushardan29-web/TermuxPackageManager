@@ -1,5 +1,7 @@
 # tpm - Termux Package Manager & Storage Analyzer
 
+> GitHub: [tushardan29-web/TermuxPackageManager](https://github.com/tushardan29-web/TermuxPackageManager.git)
+
 A safe, intelligent CLI/TUI tool that sits on top of your existing package
 manager to answer: *What is consuming my storage? What depends on what?
 What happens if I remove package X?*
